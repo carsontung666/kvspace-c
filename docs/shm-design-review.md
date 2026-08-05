@@ -1,364 +1,303 @@
-# KVSpace 共享内存方案评审
+# 关于 KVSpace SHM 方案的几个问题
 
-## 1. 范围
+我把 `deepx-design` 里几份 SHM 草案和现在的 `kvspace-c` 实现放在一起看了
+一遍。整体方向没有问题：KVSpace 确实适合放进共享内存，本地进程不应该再绕
+一圈网络；远端读取也可以考虑 RDMA。
 
-本文评审 `deepx-design` 中与 KVSpace 共享内存有关的几份草案，并给出
-`kvspace-c` 的实现建议。评审关注四个问题：
+现在比较难判断的是，几份草案其实在讨论不同阶段的问题：
 
-1. 本地多进程共享内存应采用什么布局和生命周期协议；
-2. ART、Hash、Trie 等索引在 KVSpace 工作负载下各自适合什么场景；
-3. 进程崩溃恢复能够提供哪些保证，不能提供哪些保证；
-4. 本地 mmap 数据和远端 RDMA 数据能否共用同一套布局。
+- `kvspace-shm.md` 更像 RDMA-first 的总设计，选了固定 region、cuckoo、
+  seqlock/CRC、one-sided GET 和 RPC 写；
+- `kvspace-c.md` 重点在本地 ART，实现上又选择了大 VMA 加动态
+  `ftruncate`；
+- ArtBox、Hash、memkv 几份文档是在比较本地索引和 allocator。
 
-本文不是持久格式规范。当前实现的格式、恢复状态机和兼容性约束仍以
+它们不完全矛盾，但还没有合成一份可以直接照着实现的设计。下面不是重写一份
+spec，而是我认为下一轮需要先讲清楚的几个点，以及如果现在让我实现，我会怎么
+选。
+
+当前持久格式和恢复细节仍以
 [DESIGN_RESOLUTIONS.md](../DESIGN_RESOLUTIONS.md) 为准。
 
-评审涉及的原始草案包括：
+## 1. Region 到底要不要在线扩容
 
-- [`kvspace-shm.md`](https://github.com/array2d/deepx-design/blob/master/doc/kvspace-design-and-implementation/draft/kvspace-shm.md)：固定 region、cuckoo hash、显式目录索引，以及 one-sided GET / RPC 写入；
-- [`kvspace-c.md`](https://github.com/array2d/deepx-design/blob/master/doc/kvspace-design-and-implementation/draft/kvspace-c.md)：ART、固定节点 slab、bump value 区和虚拟地址预留扩容；
-- [`kvspace-c-art-boxmalloc.md`](https://github.com/array2d/deepx-design/blob/master/doc/kvspace-design-and-implementation/draft/kvspace-c-art-boxmalloc.md)：ART 与可回收 Box allocator 的组合；
-- [`kvspace-c-hash.md`](https://github.com/array2d/deepx-design/blob/master/doc/kvspace-design-and-implementation/draft/kvspace-c-hash.md)：固定容量开放寻址 Hash 与显式目录索引；
-- [`kvspace-c-memkv-reuse.md`](https://github.com/array2d/deepx-design/blob/master/doc/kvspace-design-and-implementation/draft/kvspace-c-memkv-reuse.md)：复用 block/box allocator，并讨论 256 叉 byte trie。
+### Owner 现在的想法
 
-这些文件记录的是同一阶段的候选方案，不应被当作一份已经收敛的规范。
-例如，`kvspace-c.md` 前半部分主张取消目录 Index，后半部分的完整 API
-设计又重新要求目录 key 保存 Index TLV；Hash 草案则从一开始就要求显式
-Index。实现时需要逐条验证，而不是从某一份草案直接推导最终布局。
+`kvspace-shm.md` 的 v0 是固定 region，创建时给定容量，不自动扩容。后来的
+`kvspace-c.md` 又推荐了另一种做法：先映射一个很大的虚拟地址范围，比如
+64 GB，底层文件先只扩到 128 MB；空间不够时再 `ftruncate`，原 mapping
+继续使用。
 
-## 2. 结论
+这个方案的吸引力很直接：所有引用仍然是 `base + offset`，不用 remap，也不
+需要 chunk table。
 
-本地 SHM 建议采用以下基线：
+### 我想先问的问题
 
-- 创建时一次性确定固定容量，先把 backing object 扩展到完整
-  `max_size`，再映射和初始化；
-- 所有持久引用使用 offset 或 allocator-local ID，不保存进程虚拟地址；
-- 通用标量和引擎记录使用明确的小端编码；原生 pthread 对象只属于受限的
-  Linux/glibc 控制面；
-- 保留显式 `Index`、`ExtIndex` 和 `LinkIndex` 语义，不用 ART 内部节点代替
-  目录记录；
-- v1 使用一个 process-shared robust mutex 串行化操作，通过 COW、最后发布
-  root/selector 和 allocator 重建处理进程死亡；
-- 只承诺进程死亡恢复，不承诺断电持久化、系统重启恢复或多 key 事务；
-- 没有真实应用 trace 时，`ArtBox` 可作为保守的通用候选，但不能仅凭数据
-  结构名称决定默认引擎。
+1. 在线扩容是实际需求，还是为了避免让调用方填写 `max_size`？
+2. 所有 attach 进程能否保证一开始就使用相同的最大 mapping 长度？旧版本
+   client 怎么处理？
+3. `ftruncate` 失败、tmpfs 配额耗尽或者进程在更新 size 的中间死亡时，谁来
+   决定哪些 offset 已经可以访问？
+4. 如果同一块内存以后要注册为 RDMA MR，扩容后是重新注册、增加新 MR，还是
+   让所有客户端继续使用旧 rkey？
 
-RDMA 不应直接注册并暴露当前整个 region。可保留同一个 backing object 和
-同一份语义权威数据，但必须区分本地控制面与远端只读数据面。远端 v1 只做
-可校验的 one-sided point Get；写入、目录操作、通知和维护操作由 host RPC
-执行。
+最大的问题是，mmap 成功不等于 EOF 后面的页已经可以安全访问。访问完整 EOF
+之后的页面可能得到 `SIGBUS`；底层文件改变大小后，不能把所有既有 mapping
+会立刻安全扩展当成可移植协议。LMDB 也没有把 resize 做成无协调的透明操作，
+其他进程需要发现 map size 变化并重新采用新配置。
 
-## 3. 对关键设计问题的判断
+### 我的建议
 
-| 问题或命题 | 判断 | 原因 |
-| --- | --- | --- |
-| 本地 mmap 与 RDMA 使用同一份物理数据 | 有条件成立 | 数据页可以共用，但 pthread、allocator journal 和回收协议不能直接成为远端 ABI |
-| 先映射巨大 VMA，再通过 `ftruncate` 在线扩大文件即可透明扩容 | 不作为正确性基础 | 映射超过 EOF 的访问可能触发 `SIGBUS`；底层文件改变大小后既有 mapping 的行为不适合作为可移植协议保证 |
-| ART 内部节点可以完全替代目录 Index | 不成立 | ART edge 是分支字节，不是直接子项名；压缩前缀、空目录、ExtIndex 和 LinkIndex 都需要显式语义记录 |
-| `List` 读取 ART child 数组后可变为 O(1) | 不成立 | 返回 k 个名字至少需要 O(k) 和相应输出字节；内部 child 也不一定与目录项一一对应 |
-| 现有草案足以确定普遍默认引擎 | 未证实 | 草案比较了复杂度、推算延迟、空间、代码量和假设 workload，但缺少统一 trace 与同条件实测；原始 ART 论文也不包含共享内存 COW、allocator、TLV 和全局锁成本 |
-| Hash 查找与 key 长度无关 | 不成立 | 计算 hash 至少需要读取完整 key，碰撞时还要比较 key；低负载时探测次数通常较少，当前线性探测最坏仍可扫描完整 table |
-| 草案中的锁和并发描述覆盖 owner-death 恢复 | 未覆盖 | 各草案分别描述了 process-shared mutex、自旋锁或 CAS/seqlock，但没有给出进程持锁死亡后的结构恢复协议 |
-| one-sided GET、RPC mutation | 成立 | 该边界避免把远端写锁、分配、回收和客户端故障恢复一次性引入 v1 |
-| 一个全局锁适合作为最终并发方案 | 不成立 | 它适合先建立正确性基线，但所有 Get、Set、List、Watch 状态变化都会在多核下争用同一个锁 |
+本地 v1 不做在线扩容：
 
-## 4. 本地 SHM 设计
+1. Create 先完整计算 header、queue、allocator 和 engine section；
+2. 所有 checked arithmetic 和容量检查通过后，执行
+   `ftruncate(fd, max_size)`；
+3. 映射完整 `[0, max_size)`；
+4. 最后才初始化 header 和 ready 状态。
 
-### 4.1 创建和映射
+Attach 先用 `fstat` 和有界读取验证 magic、版本、layout hash、engine ID 和
+完整文件长度，再映射整个 region。这样 allocator 的逻辑容量耗尽可以作为普通
+的 `ErrCapacity` 返回，也不会因为进程看到不同的文件长度而访问完整 EOF 之后
+的页面。这里仍有一个绕不过去的边界：`ftruncate` 只建立逻辑长度，如果 tmpfs
+或文件系统在后续 page fault 时真正耗尽空间，进程仍可能收到 `SIGBUS`。
 
-创建过程应在第一次持久写之前完成全部几何计算和边界检查：
+如果以后证明确实需要增长，我倾向于二选一：创建新 region 后切换
+generation，或者增加固定大小的 chunk/MR。两种方案都显式通知客户端，虽然
+代码多一点，但不会把文件大小变化藏在 allocator 里面。
 
-1. 校验 `max_entries`、`max_queues`、页大小和引擎参数；
-2. 用 checked arithmetic 计算 header、队列、allocator 和引擎区间；
-3. 证明所有区间互不重叠且落在 `[0, max_size)`；
-4. 执行 `ftruncate(fd, max_size)`；
-5. 映射完整 `[0, max_size)`；
-6. 初始化 header、引擎区、robust mutex 和 condition variable；
-7. 最后发布 ready 状态。
+## 2. 能不能用 ART 节点代替目录 Index
 
-Attach 不能先信任 backing object 中的长度和 offset。它应先通过 `fstat` 和
-有界读取检查 magic、版本、endian、header size、engine ID、layout hash 和
-`region_size == region_max`，确认文件至少覆盖完整 region 后才映射并遍历
-内部记录。
+`kvspace-c.md` 前半部分提出，目录就是 ART 中的公共前缀节点，所以普通目录
+不必再保存 `Index` TLV；`List` 可以直接返回节点的 children。这个思路能省掉
+目录值的更新和 TLV 编解码。
 
-该方案会预留较大的逻辑文件和虚拟地址范围，但避免了在线增长期间不同进程
-看到不同 size、访问 EOF 后页面以及重新注册 RDMA MR 等问题。`ftruncate`
-只建立逻辑长度，不等于预留全部物理空间；tmpfs 配额或文件系统空间耗尽仍需
-作为运行时错误处理。
+但同一份文档后面的完整 API 设计又恢复了 `/a/ -> Index TLV`。Hash 草案也
+明确依赖显式 Index。这里需要先选定语义，不能让不同 engine 各自解释目录。
 
-如果未来确实需要增长，应在以下方案中单独选择，而不是默认认为原 mapping
-会安全扩展：
-
-- 创建新 region，复制并切换 generation；
-- 使用固定大小的多个 chunk，并显式发布 chunk table；
-- 在无活跃客户端的维护窗口重新映射。
-
-### 4.2 持久引用和 ABI
-
-region 内不能保存进程指针。不同进程的 mmap 基址可以不同，远端客户端也不
-共享主机虚拟地址。允许的引用形式包括：
-
-- 相对 region 起点的 64 位 offset；
-- allocator 内部的固定宽度 object ID；
-- 带有明确 null 编码和范围校验的 biased offset。
-
-所有可移植记录都应逐字段编码，不能把 C/C++ native struct 当作跨版本、跨
-编译器协议。当前 common header 中的 `pthread_mutex_t` 和
-`pthread_cond_t` 是例外，因此整个 ABI 明确限制在 little-endian x86_64
-Linux 和指定的 glibc pthread ABI。它不是通用的跨平台 C ABI，更不是网络
-协议。
-
-### 4.3 目录语义
-
-KVSpace 的目录不是索引实现的偶然内部节点，而是公开语义：
-
-- 普通目录保存 `Index`，内容为本地直接子项；
-- `ExtIndex` 保存本地子项和 fallback 目录；
-- `LinkIndex` 改变路径解析；
-- `/a` 与 `/a/` 是两个独立 key；
-- 空目录在没有任何子 key 时仍需要存在。
-
-压缩 ART 不能替代这些记录。例如同时存在 `/a/bb/x` 和 `/a/bc/y` 时，
-`/a/` 下的 ART 可能只有一个边 `b`，之后才在更深位置分裂；读取该节点的
-child 数组得不到目录项 `bb` 和 `bc`。同理，路径压缩可能使 `/a/` 根本不是
-一个独立物理节点。
-
-因此：
-
-- `List(prefix, false)` 读取本地目录记录；
-- `List(prefix, true)` 在完成 link 解析后按 ExtIndex 规则合并 fallback；
-- 返回 k 个名字的复杂度至少为 O(k) 加输出字节；
-- `DelTree` 的物理删除不能只相信可由用户写入或可能损坏的 Index，应以实际
-  key 前缀枚举为最终依据。
-
-### 4.4 并发和恢复
-
-一个 region-wide robust mutex 是合理的 v1 起点。它提供清楚的顺序关系，
-也让四个引擎可以先共享同一套语义层和恢复框架。但 robust mutex 只提供
-owner-death 通知，不提供事务回滚。
-
-每次 mutation 应遵循以下提交顺序：
-
-1. 在未发布区域构造新节点、value 或 table image；
-2. 完整校验即将发布的结构；
-3. 写入 entry count、node count 等可推导计数，并递增非权威的诊断字段
-   generation；owner-death recovery 会从已提交 root/table 重建计数，
-   generation 不参与内容正确性判断；
-4. 以 release store 最后发布 root 或 active-table selector；
-5. 只在发布后回收旧对象。
-
-发生 `EOWNERDEAD` 后，恢复分为两个阶段：
-
-- Prepare 只读，检查 immutable geometry、权威 root/table、对象引用、journal
-  和 allocator 边界，并在内存中生成完整修复计划；
-- Apply 执行可重复的修复，重建 free list、bitmap、counter 和 queue 状态；
-  成功后才调用 `pthread_mutex_consistent`。
-
-确定性格式损坏应让 mutex 进入不可恢复状态。临时内存不足等 Prepare 失败
-不能把部分修复伪装成成功；Apply 中途死亡后，下一 owner 必须能够重新
-Prepare 并收敛。
-
-该协议只针对仍在运行的内核中的进程死亡。它不包含 `msync`/`fsync` 顺序、
-双 meta page、文件目录同步或 torn-write 模型，因此不是断电持久化协议。
-
-POSIX 还规定，包含进程共享同步对象的最后一个 mapping 被所有进程解除后，
-同步对象状态不再具有可移植保证。如果产品要求“零客户端一段时间后仍能按
-严格契约重新 Attach”，应让一个 region host 在生命周期内始终保持 mapping，
-或者把该行为明确限制为经过测试的 Linux/glibc 扩展。
-
-`Destroy` 也应作为离线操作：unlink 只删除名字，已有 mapping 仍然引用旧
-对象；随后用同名 Create 可以生成另一个对象，形成两个同时存活的 region。
-
-## 5. 四种引擎的取舍
-
-记 `K` 为 key 字节数，`C` 为 Hash table capacity，`D` 为目标前缀下的
-条目数。
-
-| 引擎 | 点查与前缀 | mutation 和回收 | 适用判断 |
-| --- | --- | --- | --- |
-| `ArtBump` | 压缩 ART，点查随 K 和树高变化；前缀定位后枚举子树 | 节点 slab 可回收，prefix/value 继续追加到 raw zone，依赖 `Compact` 回收 | 适合读多写少、生命周期明确或允许维护窗口的场景 |
-| `ArtBox` | 压缩 ART，支持从匹配子树枚举 | COW 路径节点；旧 value 和节点在发布后由 FixedBlock/Box 回收 | 当前最均衡的通用候选，仍需真实 trace 验证 |
-| `HashBox` | 读取完整 key 计算 hash，再线性探测；前缀操作需扫描物理 key | 当前每次 mutation 清空 inactive table、扫描 active table、重插 live entry、发布 selector，再清空旧表 | 小容量、强读多写少时可能合适；当前提交协议不适合作为大容量更新型默认值 |
-| `TrieBox` | 严格逐 byte 下降；理论上可从 prefix 节点枚举 | 每次更新复制 byte path，每节点固定 1032 字节；当前 prefix 枚举实现还会先遍历全树 | 可作为简单基线；深路径和低 fanout 时空间放大明显 |
-
-### 5.1 ART
-
-ART 的 Node4/16/48/256 能根据 fanout 调整空间，适合路径 key 和公共前缀较多
-的场景。原始 ART 论文中的 Node16 SIMD 是常数优化，不是从 O(16) 变成新的
-渐进复杂度；16 本来就是固定上限。当前实现仍需用隔离 benchmark 判断
-scalar、binary search、SSE2 或 NEON 哪种方案值得维护。
-
-论文结果不能直接套到本实现。共享内存版本增加了 COW、allocator、TLV、
-robust mutex 和恢复检查，这些成本可能超过单个节点查找的差异。
-
-### 5.2 Hash
-
-Hash 的优势是点查不需要沿树逐层下降。当前 HashBox 使用线性探测，probe 数
-随装载率和聚簇变化，最坏可扫描完整容量；只有未来采用固定 bucket 或 cuckoo
-的远端 projection 才能给出较小的 probe 上界。当前 HashBox 的主要问题不在
-hash 函数，而在 crash-consistent 提交方式。每次 mutation 都包含完整容量的
-清零和扫描，并重插 live entry；校验、区间排序和碰撞行为还会增加额外成本。
-因此不能把它描述成“所有操作 O(1)”。
-
-若要让 HashBox 成为通用默认值，应先重新设计写入协议，例如使用 per-slot
-journal、分段 COW 或可恢复的增量 table 更新。引入 cuckoo hashing 只能限制
-读取 probe，不能自动解决多 slot displacement、rehash 和 crash atomicity。
-
-### 5.3 引擎选择方法
-
-默认引擎应由两层 benchmark 决定：
-
-1. engine 层直接测 Get、Put、Erase、EntriesWithPrefix，隔离 allocator 和
-   index 成本；
-2. semantic 层通过 `ShmClient` 测完整 TLV、目录 Index、Link/ExtIndex、
-   Notify/Watch 和 DelTree。
-
-测试至少覆盖：
-
-- `max_entries` 为 1K、10K、100K、1M，并区分实际 live entries；
-- key 长度 16、32、64、128 字节和不同路径深度、fanout；
-- value 为 None、16B、128B、4KiB；
-- Get hit/miss、Zipf hot set、持续覆盖写、批量 Set；
-- 小目录和大目录的 List，以及删除 0.01%、1%、50% 数据的 DelTree；
-- ArtBump 首次 Compact 前的 high-water/live 比和 Compact pause；
-- 1、4、16 个进程下全局 mutex 的吞吐与 p99；
-- Close/Attach、owner death 和恢复后的结果 digest。
-
-指标应包括吞吐、p50/p99/p999、CPU cycles、cache/TLB miss、每次 mutation
-触碰的字节、allocator 高水位、物理空间放大和恢复时间。没有这组数据时，
-`ArtBox` 只是风险较低的工程起点，不是已经证明的性能冠军。
-
-## 6. RDMA 方案
-
-### 6.1 当前 region 不能直接暴露
-
-当前 common header 含有原生 `pthread_mutex_t` 和 `pthread_cond_t`。RNIC
-不能成为 robust mutex owner，不能进入 Linux robust list，也不能执行
-futex wake 或 condition broadcast。远端 one-sided reader 同样不会获取本地
-全局锁。
-
-另一个关键问题是对象回收。本地 reader 在 mutex 保护下读取；writer 发布新
-root 或 table 后可以立即回收旧对象。远端 reader 可能已经读到旧 offset，
-但 host 无法知道它何时完成下一次 RDMA READ。若旧空间被立即复用，远端会把
-不同 generation 的 metadata 和 value 拼在一起。当前 allocator journal 的
-checksum 只服务本地恢复，不能替代逐 entry 的远端一致性校验。
-
-### 6.2 建议布局
-
-可以保留一个 backing object，但明确分为两个协议域：
+这里我卡在一个很具体的反例：ART 的 child edge 只有一个 byte，它什么时候等于
+一个直接子项名？例如：
 
 ```text
-kvregion backing
-├── local-control
-│   ├── pthread mutex / condition
-│   ├── allocator journal
-│   └── recovery / lifecycle state
-└── rdma-data
-    ├── stable offset or object ID
-    ├── immutable key/value payload
-    ├── version and incarnation
-    └── checksum
+/a/bb/x
+/a/bc/y
 ```
 
-本地进程可以映射全部区域；远端只获得 `rdma-data` 的 read-only rkey。
-`local-control` 不注册，或至少不授予 remote read/write/atomic 权限。
+在 `/a/` 下面，ART 完全可能只有一个 edge `b`，到更深的位置才分成 `bb` 和
+`bc`。读取 `/a/` 对应节点的 children，得不到应该返回的两个目录项。路径压缩
+还可能让 `/a/` 根本不是一个独立物理节点。
 
-远端 point Get 至少执行：
+另外还有三个不能靠树形推导的情况：
 
-1. 读取 bucket/root metadata，包括 offset、version 和 incarnation；
-2. 读取 immutable key/value；
-3. 再次读取 metadata；
-4. 检查前后 version 相同且为已提交状态；
-5. 校验 key、长度和 checksum，不满足则重试。
+- 空目录没有 child，但仍然应该存在；
+- `ExtIndex` 同时保存本地 children 和 fallback；
+- `LinkIndex` 会改变路径解析。
 
-跨多个 cache line 的对象需要逐 cache-line version，或者对象级 checksum 加
-前后 version。单纯把一个 generation counter 放在 region header 中不足以
-保护多次 RDMA READ 之间的对象复用。
+即使能直接找到 children，返回 k 个名字也至少要写出 k 个结果，不能说
+`List` 是 O(1)。
 
-### 6.3 回收、扩容和失效
+所以我不会删 Index。我会让四个 engine 共用同一套目录语义：
 
-one-sided reader 对 host 不可见，因此发布新对象后不能立即复用旧对象。
-需要 epoch、lease 或 RCU 类协议：
+- 普通目录存 `Index`；
+- 扩展目录存 `ExtIndex`；
+- link 目录存 `LinkIndex`；
+- `/a` 和 `/a/` 继续作为两个不同 key；
+- `List(prefix, false)` 只读本地 children；
+- `List(prefix, true)` 在 link 解析后合并 ExtIndex fallback。
 
-- 客户端连接时取得 epoch 和 rkey；
-- 被替换对象进入 retire list；
-- 旧 epoch 的 lease 全部结束后才回收；
-- host 重启、Compact、region replacement 或 MR 变化时提升 epoch 并轮换
-  rkey；
-- 客户端发现 epoch 变化后丢弃缓存 offset 并重新连接。
+ART、Hash、Trie 只负责“完整 key 到 value”的物理索引，不负责重新定义目录。
+`DelTree` 的最终删除也应该扫描实际 key 前缀，不能只相信可能被用户写坏或已经
+不一致的 Index。
 
-RDMA region 不应依赖对已注册巨大 mapping 进行透明 `ftruncate`。扩容可以
-增加固定 MR/chunk，或者创建新 region 后切换 generation。两种方式都需要
-显式更新远端 capability。
+## 3. 四个 engine 里应该默认用哪个
 
-### 6.4 操作边界
+几份草案对 engine 的分析其实不差，而且比较的不只是复杂度：
 
-v1 只考虑 one-sided point Get。以下操作由 host RPC 执行：
+- ArtBump 的节点简单，value/prefix 追加写，但长期运行需要 Compact；
+- ArtBox 用可回收 allocator 换掉 bump zone；
+- Hash 的点查路径短，目录继续走显式 Index；
+- 256 叉 Trie 实现直接，但稀疏路径浪费空间。
 
-- Set、Del、Clear 和 Compact；
-- List、DelTree 和目录 Index 维护；
-- Link/ExtIndex 路径解析；
-- Notify、Watch 和 queue 生命周期；
-- allocator、GC 和 recovery。
+这些判断大体合理。缺少的是同一组 workload 下的实测，所以现在还不能从这些
+分析直接得到“默认 engine”。
 
-本地最优索引和远端最优索引不一定相同。ART 在 CPU cache 中的多层下降成本
-较低，但远端每个依赖指针都可能增加一次网络往返；固定 bucket 的 Hash/Cuckoo
-更适合限制远端 probe 数。产品应坚持“一份语义权威”，不必把“一份物理索引”
-当成不可妥协目标。短期可以由 host 维护只读 RDMA projection，长期再决定是否
-把权威格式收敛到可直接远端读取的布局。
+我还缺几个最基本的 workload 数字：实际 `max_entries` 和平均 live entries、
+读写比、key 的长度和 fanout，以及服务能不能接受 Compact。一次 VM step 里
+Get、Set、List、DelTree 各有多少，也会直接改变选择。
 
-## 7. 与 owner 草案的主要差异
+这些问题会直接改变结果。比如当前 HashBox 的 Get 很短，但 mutation 不是普通
+的原地 linear-probing update。它会清空 inactive table、扫描 active table、
+把 live entry 重插到 inactive table、发布 selector，然后清空旧表。这里至少
+包含按配置容量增长的清零和扫描，即使当前只有很少的 live key。
 
-| 方面 | 原始草案中的倾向 | 本文建议 |
-| --- | --- | --- |
-| 文档定位 | 既有高层 SHM 方案，也有多份按复杂度、推算延迟、空间、代码量和假设 workload 比较的本地引擎草案，但没有统一实验收敛 | 把草案视为假设集合，以语义、标准和统一 workload 逐项筛选 |
-| region 增长 | 草案不一致：`kvspace-shm.md` 的 v0 使用固定 region，`kvspace-c.md` 另行推荐巨大 VMA 加在线 `ftruncate` | v1 固定完整 region；增长使用新 region、chunk 或维护窗口 |
-| 目录 | 一度尝试用 ART 节点消除 Index | 保留 Index、ExtIndex、LinkIndex，树只负责 key 索引 |
-| 默认引擎 | 已比较查找复杂度、推算延迟、回收、空间和实现量，并按假设 workload 给出条件性选择；尚无统一 trace 实测 | 再纳入提交协议、长期 churn 和真实 trace；无数据时以 ArtBox 为保守候选 |
-| Hash | 强调期望 O(1) 点查 | 同时计入完整 key hash、全容量 table image 和 prefix scan |
-| 崩溃恢复 | 草案描述了 process-shared 锁、自旋锁或 CAS/seqlock，但没有 owner-death 后的结构恢复协议 | robust lock 只提供通知；必须 COW、最后发布、只读 Prepare 和可重复 Apply |
-| 生命周期 | 已说明进程退出后 region 存在、机器重启丢失、固定容量和显式 `shm_unlink` | 保留这些边界，并补充最后 unmap 后同步对象保证、同名重建 split-brain 和物理容量限制 |
-| RDMA | 同一 region 注册为 MR；GET 用 seqlock/CRC 校验，远端 mutation 走 RPC；未隔离原生控制面，也未定义 one-sided reader 的延迟回收 | 保留可校验 GET 与 RPC 写边界；控制面不暴露，并增加 incarnation、epoch/lease 和 rkey 失效协议 |
-| 一致性目标 | 同一物理 region 和同一布局 | 一份语义权威；允许远端 read projection，不强迫本地和远端共用同一索引 |
+另外，公共 `Set` 对每个 pair 分别 Begin/Commit。kvlang 更新 PC 和 status 时
+一次传两个 pair，因此 HashBox 会做两次 table image。这个成本可能比 hash
+函数或 ART Node16 的差异大得多。
 
-## 8. 落地顺序
+TrieBox 也有类似的“理论结构和当前实现不是一回事”的问题：Trie 理论上可以
+先走到 prefix 再枚举，但当前 `EntriesWithPrefix` 会先遍历全树再过滤。
 
-### 第一阶段：固定本地正确性边界
+我的做法是先不把四个 engine 当成四个长期产品选项，而是用它们做一次同条件
+选择：
 
-- 保持当前固定 section、显式小端记录、offset 引用和 robust mutex；
-- 保持 COW、root/selector 最后发布和从权威对象图重建 allocator；
-- 明确文档保证仅覆盖目标 Linux/glibc 上的进程死亡；
-- 把 Destroy 定义为离线操作，并为长期生命周期保留 host mapping。
+- engine 层测 Get、Put、Erase、EntriesWithPrefix；
+- `ShmClient` 层再测 TLV、Index、Link/ExtIndex、Notify 和 DelTree；
+- 容量至少覆盖 1K、10K、100K、1M，并区分配置容量和 live entries；
+- 单独测持续热更新、ArtBump 到第一次 Compact，以及 1/4/16 个进程争用；
+- 除了吞吐，记录 p99、触碰字节、allocator 高水位、物理空间和恢复时间。
 
-### 第二阶段：用 trace 选择引擎
+如果现在必须先给一个默认值，我会先用 ArtBox。原因不是它一定最快，而是它
+有路径压缩，也能正常回收 value，长期运行的风险比 ArtBump 小；同时不会像
+当前 HashBox 那样让每次写都包含完整 table image。
 
-- 记录并回放 kvlang 的实际 KV 调用序列；
-- 同时测 engine 层和完整语义层；
-- 在改掉全 table image 提交前，不把大容量 HashBox 作为更新型默认值；
-- 按持续 churn、空间放大和维护暂停决定是否启用 ArtBump；
-- 在确认真实瓶颈前，不新增 HOT、Masstree 或 cuckoo 持久化实现。
+这个选择应该是临时的。真实 trace 如果证明短 key Trie 更快且空间可以接受，
+就选 Trie；如果 HashBox 的 point-read 优势决定了总时间，就先重做 Hash 的
+mutation protocol，再讨论默认值。没有数据前不值得再实现 HOT、Masstree 或
+另一套 cuckoo 持久化 engine。
 
-### 第三阶段：只读 RDMA 数据面
+## 4. 进程死在 mutation 中间时，谁是可信状态
 
-- 先实现 read-only export/projection；
-- 加入 version、incarnation、checksum 和 epoch/lease；
-- mutation 和复杂语义保持 RPC；
-- 用远端往返次数、重试率、回收延迟和 MR/rkey 更新成本验证方案。
+高层 SHM 草案已经说明：进程崩溃后 region 继续存在，机器重启后可以丢；
+并发方案里也出现了 process-shared mutex、自旋锁以及 CAS/seqlock。这个保证
+边界是合理的。
 
-### 第四阶段：按测量结果扩展
+没有展开的是 owner death 之后如何判断 allocator、counter 和 root 哪一个
+可信。普通 mutex 只解决并发，不能把死亡进程写了一半的数据自动回滚。
 
-只有在全局 mutex 已成为可重复的瓶颈后，再考虑分段锁、node-level lock 或
-optimistic read。只有在 RPC mutation 明确不能满足目标时，才讨论 remote
-write/atomic；该步骤需要独立设计锁租约、日志、客户端故障解锁和远端 allocator，
-不能在现有 pthread 协议上直接打开 `REMOTE_WRITE`。
+我主要关心三类 crash window：
 
-## 9. 参考资料
+- root 发布前后，counter、新对象和旧对象分别处于什么状态；
+- allocator 或 recovery 自己写到一半又被杀；
+- 最后一个 client unmap，或者 Destroy 后旧 mapping 与同名新对象并存。
 
-- [POSIX `mmap`](https://pubs.opengroup.org/onlinepubs/9799919799/functions/mmap.html)
+如果这些状态没有唯一的 authority，就只能把“看起来合理”的 allocator 元数据
+当真，恢复很容易提前复用仍被 root 引用的对象。
+
+本地 v1 我会继续用一个 region-wide robust mutex。它不利于多核扩展，但先把提交
+边界做清楚更重要：
+
+1. 在未发布区域写完整的新节点、value 或 table image；
+2. 完整校验新结构；
+3. 写入可推导的 counter，并递增仅用于诊断的 generation；
+4. 以 release store 发布 root 或 active-table selector；
+5. 发布之后才回收旧对象。
+
+我倾向于仍把 root/table selector 当作语义 authority。counter、free list、
+bitmap 等从已提交对象图重新生成，generation 只做诊断，不参与内容正确性判断。
+
+拿到 `EOWNERDEAD` 后，恢复分成两段：Prepare 只读并生成完整修复计划；全部
+检查通过后 Apply 才开始写。成功后再调用 `pthread_mutex_consistent`。确定性
+损坏应该 poison mutex；临时分配失败不能把 region 标成“已经修好”。Apply
+中途再次死亡时，下一个 owner 必须可以重新 Prepare 并收敛。
+
+这里我只会承诺“目标 Linux/glibc 上的进程死亡恢复”，不会写成断电持久化。
+当前没有 `msync`/`fsync` 顺序、双 meta page 和 torn-write 模型。
+
+还有一个容易漏掉的生命周期问题：POSIX 不保证最后一个 mapping 消失后，原
+process-shared pthread 对象仍可移植地复用。当前代码可以把零 client 后重新
+Attach 当作目标 Linux/glibc 上经过测试的行为；如果要把它写成更强的平台无关
+契约，我会让一个 region host 在整个生命周期保持 mapping。`Destroy` 也只当
+离线操作；否则旧 mapping 和同名新对象可以同时存在。
+
+## 5. SHM 和 RDMA 是否一定要共用“同一个 region”
+
+这是 owner 方案里我最赞同的方向：本地 mmap 和远端 RDMA 不应该维护两份
+语义存储。`kvspace-shm.md` 也已经选了一个比较稳妥的 v0 边界：GET 用
+seqlock/CRC 做 one-sided 校验，远端 mutation 交给 server RPC。
+
+问题不在“one-sided GET + RPC 写”这个选择，而在当前整个本地 region 能不能
+原样注册成远端协议。
+
+当前 common header 里直接放了 `pthread_mutex_t` 和 `pthread_cond_t`。远端
+reader 不会拿这个 mutex，也不能参与 futex、robust list 或 condition wake。
+
+更麻烦的是回收。本地 reader 在全局锁内访问；writer 发布新 root 后可以立即
+回收旧节点。远端 reader 可能已经读到旧 offset，但 host 根本不知道它下一次
+RDMA READ 什么时候完成。如果这时复用旧空间，CRC 可以发现部分错误，却不能
+代替“这个对象现在是否仍允许被引用”的生命周期协议。
+
+还需要明确两件事：
+
+1. ArtBox/ART 的多层依赖读取是否真的适合 one-sided RDMA？每层指针都可能是
+   一次新的网络往返。
+2. region 扩容或 Compact 后，旧 MR、rkey 和客户端缓存的 offset 怎么失效？
+
+我的 v1 会保留“一份语义权威”，但不强求“一份物理索引”。同一个 backing object
+可以分成两块：
+
+```text
+local-control
+  pthread / condition / allocator journal / recovery state
+
+rdma-data
+  stable offset / immutable key-value / version / incarnation / checksum
+```
+
+本地进程映射全部区域。按这个边界，我不会给远端暴露控制面；客户端只拿
+`rdma-data` 的 read-only rkey。
+
+远端 Get 的最低协议是：先读 metadata，再读 immutable value，最后重读
+metadata；前后 version/incarnation 一致且 checksum、key、length 都正确才返回，
+否则重试。旧对象不能马上复用，要进入 retire list，等旧 epoch/lease 全部结束
+后再回收。host 重启、Compact、替换 region 或重新注册 MR 时都提升 epoch、
+轮换 rkey，让客户端丢弃缓存 offset。
+
+除只读 point Get 外，其余写入和管理操作先走 host RPC。以后如果真实测量
+证明 RPC 写不够，再单独设计 remote lock、lease、journal 和 allocator；
+不能直接在 pthread 协议上打开 `REMOTE_WRITE`。
+
+短期如果本地 ArtBox 不适合远端读取，可以由 host 维护一个 read-only 的
+fixed-bucket/cuckoo projection。它是派生索引，不是第二份语义权威。这样比为了
+“物理上只有一份 index”而让本地和远端都使用不合适的数据结构更实际。
+
+## 6. 全局锁要不要现在就拆
+
+本地方案倾向于一个全局 process-shared lock。实现简单，KVSpace 当前也没有
+多 key transaction，因此先串行化所有操作很容易讲清楚。
+
+设计里给出的 `shm://` 延迟目标大约是 0.1--1 us，但这个数字指的是裸
+load/store、单次 Get，还是完整的 KVSpace 调用？完整调用还包含路径解析、
+TLV、Index 更新、allocator、恢复检查和 pthread lock。
+
+另外，实际部署里会同时有多少 VM、CLI 和执行器进程？如果常见情况只有一两个
+writer，提前实现 node-level lock 的收益可能很小；如果十几个进程同时 Get，
+全局 mutex 又可能很快成为主要瓶颈。
+
+这里我会先忍住，不拆锁。先把单进程、2/4/8/16 进程的吞吐和 p99 测出来。
+测试时把锁等待时间和 engine 内部时间分开。只有全局锁在真实 workload 上成为
+稳定瓶颈后，再选择：
+
+- read-mostly 时用 optimistic read + version；
+- Hash 按 bucket/shard 分锁；
+- ART 做 node-level lock 或 epoch read；
+- queue 和 KV 数据拆成独立锁域。
+
+这些方案都会扩大 owner-death 和回收状态空间，不应该只因为“全局锁看起来不
+高级”就提前加入。
+
+## 7. 我希望 owner 先确认的几个问题
+
+在继续定默认 engine 或 RDMA layout 之前，我希望先有下面这些答案：
+
+1. 真实 workload 到底是什么：容量、live entries、读写比和热 key 生命周期？
+2. 生命周期保证到哪里：零 client 后重连、机器重启和断电分别要不要支持？
+3. RDMA 只优化 point Get，还是要求全部 KVSpace 语义；“同一 region”指一份
+   语义权威，还是严格的一份物理 index？
+
+这些问题确定后，方案其实会简单很多。现在如果让我排实现顺序，我会先交付
+固定容量的本地 ArtBox + 显式目录 + robust recovery；然后用真实 kvlang trace
+决定 engine；最后再做 read-only RDMA view。不会同时推进动态扩容、细粒度锁和
+one-sided write。
+
+## 参考
+
+- [deepx-design: kvspace-shm](https://github.com/array2d/deepx-design/blob/master/doc/kvspace-design-and-implementation/draft/kvspace-shm.md)
+- [deepx-design: kvspace-c](https://github.com/array2d/deepx-design/blob/master/doc/kvspace-design-and-implementation/draft/kvspace-c.md)
+- [deepx-design: ART + boxmalloc](https://github.com/array2d/deepx-design/blob/master/doc/kvspace-design-and-implementation/draft/kvspace-c-art-boxmalloc.md)
+- [deepx-design: Hash](https://github.com/array2d/deepx-design/blob/master/doc/kvspace-design-and-implementation/draft/kvspace-c-hash.md)
+- [POSIX mmap](https://pubs.opengroup.org/onlinepubs/9799919799/functions/mmap.html)
 - [POSIX robust mutex](https://pubs.opengroup.org/onlinepubs/9799919799/functions/pthread_mutex_lock.html)
-- [Linux `shm_open` / `shm_unlink`](https://man7.org/linux/man-pages/man3/shm_open.3.html)
-- [The Adaptive Radix Tree](https://db.in.tum.de/~leis/papers/ART.pdf)
-- [Pilaf: Scalable Multi-Core In-Memory Key-Value Storage Using RDMA](https://www.usenix.org/system/files/conference/atc13/atc13-mitchell.pdf)
-- [FaRM: Fast Remote Memory](https://www.usenix.org/system/files/conference/nsdi14/nsdi14-paper-dragojevic.pdf)
-- [Using RDMA Efficiently for Key-Value Services](https://www.cs.cmu.edu/~dga/papers/herd-sigcomm2014-readable.pdf)
-- [LMDB: A Symmetric Key/Value Store](https://www.openldap.org/pub/hyc/mdb-paper.pdf)
+- [ART](https://db.in.tum.de/~leis/papers/ART.pdf)
+- [Pilaf](https://www.usenix.org/system/files/conference/atc13/atc13-mitchell.pdf)
+- [FaRM](https://www.usenix.org/system/files/conference/nsdi14/nsdi14-paper-dragojevic.pdf)
+- [HERD](https://www.cs.cmu.edu/~dga/papers/herd-sigcomm2014-readable.pdf)
