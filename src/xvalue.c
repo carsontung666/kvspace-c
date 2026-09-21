@@ -237,10 +237,51 @@ static int32_t encode_al(const char *kind, const uint8_t *raw, int32_t raw_len,
     return kvspaceXvalueEncode(kind, raw, raw_len, dims, nd, out);
 }
 
+#define KVSPACE_HEAD64 64
+static int looks_head64(const uint8_t *d, int32_t n) {
+    if (!d || n < KVSPACE_HEAD64)
+        return 0;
+    if (d[1] > KVSPACE_STORETYPE_EXTINDEX || d[3] > X_MAX_NDIM)
+        return 0;
+    uint64_t bl = 0, cap = 0;
+    for (int i = 0; i < 8; i++) {
+        bl |= (uint64_t)d[8 + i] << (i * 8);
+        cap |= (uint64_t)d[16 + i] << (i * 8);
+    }
+    if (bl > cap || (int32_t)KVSPACE_HEAD64 + (int32_t)bl > n)
+        return 0;
+    return 1;
+}
+
 xvalue_head_t kvspaceXvalueDecodeHead(const uint8_t *data, int32_t data_len) {
     xvalue_head_t h = {0};
     if (!data || data_len < X_HEAD_PREFIX)
         return h;
+    if (looks_head64(data, data_len) && rd_u16(data) != X_HEAD_PREFIX) {
+        uint8_t st = data[1];
+        uint8_t ndim = data[3];
+        uint64_t bl = 0;
+        for (int i = 0; i < 8; i++)
+            bl |= (uint64_t)data[8 + i] << (i * 8);
+        h.headlen = KVSPACE_HEAD64;
+        h.ref = (int32_t)(int8_t)data[0];
+        if (h.ref < 0)
+            h.ref = KVSPACE_REF_EXT;
+        h.storetype = st;
+        h.ro = data[2] & 1;
+        h.vid = rd_u32(data + 4);
+        h.raw_len = (int32_t)bl;
+        h.ndim = ndim;
+        for (int i = 0; i < ndim && i < X_MAX_NDIM; i++)
+            h.dims[i] = (int32_t)rd_u32(data + 28 + i * 4);
+        h.langtype = "";
+        h.langtype_len = 0;
+        h.kind = "";
+        h.kind_len = 0;
+        h.raw = data + KVSPACE_HEAD64;
+        h.array_len = store_has_dims(st) ? header_array_len(h.ndim, h.dims) : 1;
+        return h;
+    }
     h.headlen = rd_u16(data);
     h.ref = data[2];
     h.storetype = data[3];
