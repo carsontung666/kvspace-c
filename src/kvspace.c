@@ -2377,8 +2377,8 @@ int kvspaceShmList(kvspace_t *kv, const char *prefix, bool ex, int resolve,
         pfx = tbuf;
     }
     /* memindex（p·）：读 index body 成员名（唯一权威）；stringkeymap 按坐标
-     * row-major 升序。 */
-    if (read_index_names(kv, pfx, on, oc))
+     * row-major 升序。读到 0 个名字时回落到 ART scan（空 memindex 不是「没有子项」）。 */
+    if (read_index_names(kv, pfx, on, oc) && *oc > 0)
         return 0;
     int plen = (int)strlen(pfx);
     char **out = malloc(sizeof(char *) * 4096);
