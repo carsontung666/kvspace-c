@@ -9,6 +9,7 @@ include(GNUInstallDirs)
 
 add_library(kvspace-c SHARED
     src/xvalue.c
+    src/xvalue_head.c
     src/kvspace.c
     src/durable_abi.c
 )
@@ -54,4 +55,8 @@ if(KVSPACE_BUILD_TESTS)
     target_include_directories(test_handle_cache PRIVATE src)
     target_link_libraries(test_handle_cache PRIVATE kvspace-c)
     add_test(NAME handle_cache COMMAND test_handle_cache)
+
+    add_executable(test_xvalue_head tests/test_xvalue_head.c src/xvalue_head.c)
+    target_include_directories(test_xvalue_head PRIVATE src)
+    add_test(NAME xvalue_head COMMAND test_xvalue_head)
 endif()
