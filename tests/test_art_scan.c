@@ -2,6 +2,7 @@
 
 #define _GNU_SOURCE
 #include "kvspace_shm.h"
+#include "xvalue_head.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -37,8 +38,10 @@ static int set_int32(kvspace_t *kv, const char *key, int32_t v) {
   uint8_t raw[4] = {(uint8_t)v, (uint8_t)(v >> 8), (uint8_t)(v >> 16),
                     (uint8_t)(v >> 24)};
   uint8_t *tlv;
-  int32_t n = kvspaceXvalueEncode(KVSPACE_KIND_INT32, raw, 4, NULL, 0, &tlv);
-  int rc = kvspaceShmSet(kv, key, tlv, n);
+  uint64_t n = 0;
+  if (kvspaceXhNewScalar("int32", raw, 4, &tlv, &n) != 0)
+    return -1;
+  int rc = kvspaceShmSet(kv, key, tlv, (int32_t)n);
   free(tlv);
   return rc;
 }
@@ -48,8 +51,11 @@ static int32_t get_int32(kvspace_t *kv, const char *key) {
   uint8_t *d = kvspaceShmGet(kv, key, 1, &len);
   if (!d || len <= 0)
     return -1;
-  xvalue_head_t h = kvspaceXvalueDecodeHead(d, len);
-  return h.raw_len == 4 ? kvspaceXvalueRawInt32(h.raw) : -1;
+  kvspaceXh h;
+  if (kvspaceXhDecode(d, (uint64_t)len, &h) != 0 || h.content_len != 4)
+    return -1;
+  return (int32_t)((uint32_t)h.body[0] | ((uint32_t)h.body[1] << 8) |
+                   ((uint32_t)h.body[2] << 16) | ((uint32_t)h.body[3] << 24));
 }
 
 static void list_free(char **ns, int32_t n) {
@@ -87,6 +93,37 @@ static void t_correct(const char *db) {
   CHECK(set_int32(kv, "/foo/bar1", 7) == 0, "set /foo/bar1");
   CHECK(set_int32(kv, "/foo/bar2", 8) == 0, "set /foo/bar2");
   CHECK(set_int32(kv, "/foo/zzz", 9) == 0, "set /foo/zzz");
+  uint8_t raw[4] = {7};
+  uint8_t *permitted = NULL;
+  uint64_t permitted_len = 0;
+  CHECK(kvspaceXhNewScalar("int32", raw, 4, &permitted, &permitted_len) == 0 &&
+            kvspaceShmSetValue(kv, "/private", permitted, (int32_t)permitted_len, 1, 42) == 0,
+        "set permitted value");
+  free(permitted);
+  uint8_t ro = 0;
+  uint32_t vid = 0;
+  CHECK(kvspaceShmMetaGet(kv, "/private", &ro, &vid) == 0 &&
+            ro == 1 && vid == 42, "read sidecar");
+  CHECK(kvspaceShmCp(kv, "/private", "/private_copy") == 0,
+        "copy permitted value");
+  CHECK(kvspaceShmMetaGet(kv, "/private_copy", &ro, &vid) == 0 &&
+            ro == 1 && vid == 42, "copy sidecar");
+  CHECK(kvspaceShmDel(kv, "/private_copy") == 0, "delete copied value");
+  CHECK(kvspaceShmMetaGet(kv, "/private_copy", &ro, &vid) == 0 &&
+            ro == 0 && vid == 0, "delete copied sidecar");
+
+  uint8_t *ptr = NULL;
+  uint64_t ptr_len = 0;
+  CHECK(kvspaceXhNewPtr("int32", "/private", 8, &ptr, &ptr_len) == 0 &&
+            kvspaceShmSetValue(kv, "/link", ptr, (int32_t)ptr_len, 1, 17) == 0,
+        "set pointer metadata");
+  free(ptr);
+  CHECK(kvspaceShmCp(kv, "/link", "/link_copy") == 0,
+        "copy pointer metadata");
+  CHECK(kvspaceShmMetaGetAt(kv, "/link_copy", &ro, &vid) == 0 &&
+            ro == 1 && vid == 17, "copy pointer slot metadata");
+  CHECK(kvspaceShmMetaGet(kv, "/link_copy", &ro, &vid) == 0 &&
+            ro == 1 && vid == 42, "resolve pointer target metadata");
 
   char **ns;
   int32_t n;
@@ -125,8 +162,46 @@ static void t_correct(const char *db) {
   REQUIRE(do_list(kv, "/", &ns, &n) == 0, "list /");
   CHECK(list_has(ns, n, "lib") && list_has(ns, n, "d") && list_has(ns, n, "foo"),
         "list / names");
+  CHECK(!list_has(ns, n, ".kvspace-meta"), "hide metadata root");
   list_free(ns, n);
 
+  CHECK(kvspaceShmMkindex(kv, "/frames/[1]/", 0) == 0, "frame directory");
+  CHECK(set_int32(kv, "/frames/[1]/value", 7) == 0, "frame child");
+  REQUIRE(do_list(kv, "/frames/", &ns, &n) == 0, "list frames");
+  CHECK(n == 1 && list_has(ns, n, "[1]/"), "deduplicate directory child");
+  list_free(ns, n);
+
+  CHECK(set_int32(kv, "/private", 8) == 0, "overwrite permitted value");
+  CHECK(kvspaceShmMetaGet(kv, "/private", &ro, &vid) == 0 &&
+            ro == 0 && vid == 0, "clear sidecar on overwrite");
+  uint8_t *body = NULL;
+  CHECK(kvspaceShmWriteNewPlace(kv, "/private", 0, KVSPACE_XH_FIXED_SMALL,
+                                1, 7, "int32", 4, 4, &body) == 0,
+        "write new permitted place");
+  if (body)
+    memcpy(body, raw, 4);
+  CHECK(kvspaceShmMetaGet(kv, "/private", &ro, &vid) == 0 &&
+            ro == 1 && vid == 7, "write-new sidecar");
+  CHECK(kvspaceShmDel(kv, "/private") == 0, "delete private value");
+  CHECK(kvspaceShmMetaGet(kv, "/private", &ro, &vid) == 0 &&
+            ro == 0 && vid == 0, "delete sidecar");
+
+  permitted = NULL;
+  permitted_len = 0;
+  CHECK(kvspaceXhNewScalar("int32", raw, 4, &permitted, &permitted_len) == 0 &&
+            kvspaceShmSetValue(kv, "/tree/a", permitted, (int32_t)permitted_len, 1, 11) == 0,
+        "set tree metadata");
+  free(permitted);
+  CHECK(kvspaceShmCptree(kv, "/tree", "/tree_copy") == 0,
+        "copy tree metadata");
+  CHECK(kvspaceShmMetaGet(kv, "/tree_copy/a", &ro, &vid) == 0 &&
+            ro == 1 && vid == 11, "copied tree sidecar");
+  CHECK(kvspaceShmDeltree(kv, "/tree_copy") == 0,
+        "delete copied tree");
+  CHECK(kvspaceShmMetaGet(kv, "/tree_copy/a", &ro, &vid) == 0 &&
+            ro == 0 && vid == 0, "deleted tree sidecar");
+
+  CHECK(kvspaceShmMkindex(kv, "/lib/", 0) == 0, "new directory value");
   CHECK(kvspaceShmExtindex(kv, "/e/", "/lib/") == 0, "extindex");
   REQUIRE(kvspaceShmList(kv, "/e/", true, 0, &ns, &n) == 0, "list /e/ ex");
   CHECK(list_has(ns, n, "a") && list_has(ns, n, "b") && list_has(ns, n, "mod"),
@@ -215,6 +290,25 @@ static void t_scale(const char *db) {
   kvspaceShmClose(kv);
 }
 
+static void t_wide(const char *db) {
+  kvspace_t *kv = kvspaceShmOpen(db, SBO_DATA_SIZE);
+  REQUIRE(kv != NULL, "open wide failed");
+  for (int i = 0; i < 4097; i++) {
+    char key[32];
+    snprintf(key, sizeof key, "/wide/%04d", i);
+    REQUIRE(set_int32(kv, key, i) == 0, "set wide %d", i);
+  }
+  char **names;
+  int32_t count;
+  REQUIRE(do_list(kv, "/wide/", &names, &count) == 0, "list wide");
+  CHECK(count == 4097, "wide count %d", count);
+  if (count == 4097)
+    CHECK(strcmp(names[0], "0000") == 0 &&
+              strcmp(names[4096], "4096") == 0, "wide order");
+  list_free(names, count);
+  kvspaceShmClose(kv);
+}
+
 int main(int argc, char **argv) {
   char tmpl[] = "/tmp/kvspace-artscan-XXXXXX";
   const char *dir = argc > 1 ? argv[1] : mkdtemp(tmpl);
@@ -222,12 +316,14 @@ int main(int argc, char **argv) {
     perror("mkdtemp");
     return 2;
   }
-  char db[512], db2[512];
+  char db[512], db2[512], db3[512];
   snprintf(db, sizeof db, "%s/db", dir);
   snprintf(db2, sizeof db2, "%s/db2", dir);
+  snprintf(db3, sizeof db3, "%s/db3", dir);
 
   t_correct(db);
   t_scale(db2);
+  t_wide(db3);
 
   if (argc <= 1) {
     char cmd[700];

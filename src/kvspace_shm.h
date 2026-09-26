@@ -8,7 +8,7 @@
 #ifndef KVSPACE_H
 #define KVSPACE_H
 
-#include "xvalue.h"
+#include "coord.h"
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -39,6 +39,8 @@ void kvspaceShmClose(kvspace_t *kv);
 // Get: resolve=1 穿透 link，resolve=0 返回 link 本身。
 uint8_t *kvspaceShmGet(kvspace_t *kv, const char *key, int resolve,
                        int32_t *out_len);
+int kvspaceShmMetaGet(kvspace_t *kv, const char *key, uint8_t *ro, uint32_t *vid);
+int kvspaceShmMetaGetAt(kvspace_t *kv, const char *key, uint8_t *ro, uint32_t *vid);
 
 int kvspaceShmResolveRef(kvspace_t *kv, const char *key, kvspaceRef_t *ref);
 uint8_t *kvspaceShmGetByRef(kvspace_t *kv, kvspaceRef_t *ref,
@@ -50,6 +52,8 @@ int kvspaceShmSetPartByRef(kvspace_t *kv, kvspaceRef_t *ref,
 // Set: 写入 value（TLV 编码的字节）。总是穿透 link 写入 target。
 int kvspaceShmSet(kvspace_t *kv, const char *key, const uint8_t *val,
                   int32_t val_len);
+int kvspaceShmSetValue(kvspace_t *kv, const char *key, const uint8_t *val,
+                       int32_t val_len, uint8_t ro, uint32_t vid);
 
 // 零拷贝写原语——返回 SHM 常驻 body 偏移指针供调用方直接写；写即持久，无收尾。
 // WriteInPlace: key 必须已存在、body_len 必须等于原 body_len（同 kind
@@ -61,6 +65,7 @@ int kvspaceShmWriteInPlace(kvspace_t *kv, const char *key, int resolve,
 int kvspaceShmWriteNewPlace(kvspace_t *kv, const char *key, uint8_t ref,
                             uint8_t storetype, uint8_t ro, uint32_t vid,
                             const char *langtype, int32_t body_len,
+                            uint64_t body_cap,
                             uint8_t **body);
 // ListLen: 只返回前缀下子项计数，无缓冲。
 int kvspaceShmListLen(kvspace_t *kv, const char *prefix, bool expand_ext,

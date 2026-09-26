@@ -8,8 +8,9 @@ set(CMAKE_C_EXTENSIONS OFF)
 include(GNUInstallDirs)
 
 add_library(kvspace-c SHARED
-    src/xvalue.c
+    src/coord.c
     src/xvalue_head.c
+    src/xvalue_meta.c
     src/kvspace.c
     src/durable_abi.c
 )
@@ -20,7 +21,7 @@ set_target_properties(kvspace-c PROPERTIES
     SOVERSION 1
 )
 
-# 无公共头：内部头在 src/（kvspace_shm.h、xvalue.h），权威 ABI 头在 kvspace 仓库。
+# Internal headers are in src/; the public ABI header is in kvspace.
 # 两个依赖库走 header-only（src/kvspace.c 里 #define *_IMPLEMENTATION），故不链接 .so；
 # 头的搜索路径由系统 include（/usr/include/blockmalloc、/usr/include/slotsboxmalloc）提供。
 
@@ -56,7 +57,11 @@ if(KVSPACE_BUILD_TESTS)
     target_link_libraries(test_handle_cache PRIVATE kvspace-c)
     add_test(NAME handle_cache COMMAND test_handle_cache)
 
-    add_executable(test_xvalue_head tests/test_xvalue_head.c src/xvalue_head.c)
+    add_executable(test_xvalue_head tests/test_xvalue_head.c src/xvalue_head.c src/xvalue_meta.c)
     target_include_directories(test_xvalue_head PRIVATE src)
     add_test(NAME xvalue_head COMMAND test_xvalue_head)
+    add_executable(test_new_wire_shm tests/test_new_wire_shm.c)
+    target_include_directories(test_new_wire_shm PRIVATE src)
+    target_link_libraries(test_new_wire_shm PRIVATE kvspace-c)
+    add_test(NAME new_wire_shm COMMAND test_new_wire_shm)
 endif()

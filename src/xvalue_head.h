@@ -1,13 +1,13 @@
-/* Wire: [u8 pow][u8 kind][u64le a][u64le b][langtype]. headlen = 1<<pow, pow >= 5.
-   langtype runs to the first 0, or to headlen-18 if none. Body follows the head.
-   0 fixed-small, pow 5: a = b = 0, body width from langtype. Empty langtype is None.
-   1 slack, pow 6: a = content bytes, b = capacity bytes, stored body is b bytes.
-   2 fixed-large, pow 7: a = numel, b = esize, body = a * b.
-   3 is rejected. */
+/* Wire: [pow][flags][a:u64le][b:u64le][langtype][body]. Head length is 1 << pow.
+   flags: low two bits are storage class; bit 2 marks a pointer. */
 #ifndef XVALUE_HEAD_H
 #define XVALUE_HEAD_H
 
 #include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 #define KVSPACE_XH_PREFIX 18u
 
@@ -15,6 +15,7 @@
 #define KVSPACE_XH_SLACK       1u
 #define KVSPACE_XH_FIXED_LARGE 2u
 #define KVSPACE_XH_EXT         3u
+#define KVSPACE_XH_PTR_FLAG    4u
 
 #define KVSPACE_XH_POW_SCALAR 5u
 #define KVSPACE_XH_POW_SLACK  6u
@@ -45,10 +46,25 @@ int kvspaceXhDecode(const uint8_t *data, uint64_t len, kvspaceXh *out);
 int kvspaceXhNewNone(uint8_t **out, uint64_t *out_len);
 int kvspaceXhNewScalar(const char *langtype, const uint8_t *raw, uint32_t raw_len,
                        uint8_t **out, uint64_t *out_len);
+int kvspaceXhNewShort(const char *langtype, const uint8_t *body, uint32_t body_len,
+                      uint8_t **out, uint64_t *out_len);
 /* data_len and cap are bytes; character counts are derived. */
 int kvspaceXhNewSlack(int elem, const uint8_t *data, uint64_t data_len, uint64_t cap,
                       uint8_t **out, uint64_t *out_len);
 int kvspaceXhNewTensor(const uint64_t *dims, uint32_t ndim, const char *elem,
-                       const uint8_t *raw, uint8_t **out, uint64_t *out_len);
+                       const uint8_t *raw, uint64_t raw_len,
+                       uint8_t **out, uint64_t *out_len);
+int kvspaceXhNewPtr(const char *langtype, const char *path, uint64_t cap,
+                    uint8_t **out, uint64_t *out_len);
+int kvspaceXhNewExt(const char *langtype, const char *locator, uint64_t cap,
+                    uint8_t **out, uint64_t *out_len);
+int kvspaceXhNewCode(const char *langtype, const uint8_t *body, uint64_t body_len,
+                     uint64_t cap, uint8_t **out, uint64_t *out_len);
+int kvspaceXhReserve(uint8_t kind, const char *langtype, uint64_t body_len,
+                     uint64_t cap, uint8_t **out, uint64_t *out_len);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

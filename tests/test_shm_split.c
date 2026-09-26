@@ -2,6 +2,7 @@
 
 #define _GNU_SOURCE
 #include "kvspace_shm.h"
+#include "xvalue_head.h"
 #include "test_util.h"
 #include <fcntl.h>
 #include <stdio.h>
@@ -31,8 +32,10 @@ static int set_int32(kvspace_t *kv, const char *key, int32_t v) {
   uint8_t raw[4] = {(uint8_t)v, (uint8_t)(v >> 8), (uint8_t)(v >> 16),
                     (uint8_t)(v >> 24)};
   uint8_t *tlv;
-  int32_t n = kvspaceXvalueEncode(KVSPACE_KIND_INT32, raw, 4, NULL, 0, &tlv);
-  int rc = kvspaceShmSet(kv, key, tlv, n);
+  uint64_t n = 0;
+  if (kvspaceXhNewScalar("int32", raw, 4, &tlv, &n) != 0)
+    return -1;
+  int rc = kvspaceShmSet(kv, key, tlv, (int32_t)n);
   free(tlv);
   return rc;
 }
@@ -42,8 +45,11 @@ static int32_t get_int32(kvspace_t *kv, const char *key) {
   uint8_t *d = kvspaceShmGet(kv, key, 1, &len);
   if (!d || len <= 0)
     return -1;
-  xvalue_head_t h = kvspaceXvalueDecodeHead(d, len);
-  return h.raw_len == 4 ? kvspaceXvalueRawInt32(h.raw) : -1;
+  kvspaceXh h;
+  if (kvspaceXhDecode(d, (uint64_t)len, &h) != 0 || h.content_len != 4)
+    return -1;
+  return (int32_t)((uint32_t)h.body[0] | ((uint32_t)h.body[1] << 8) |
+                   ((uint32_t)h.body[2] << 16) | ((uint32_t)h.body[3] << 24));
 }
 
 /* returns failure count */

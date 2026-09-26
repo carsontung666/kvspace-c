@@ -3,6 +3,7 @@
 
 #define _GNU_SOURCE
 #include "kvspace_shm.h"
+#include "xvalue_head.h"
 #include "test_util.h"
 #include <fcntl.h>
 #include <stdio.h>
@@ -15,11 +16,9 @@
 #define DATA_2MB (8UL * 64 * 64 * 64)
 #define DATA_128MB (8UL * 64 * 64 * 64 * 64)
 #define HEAD_POOL_INIT (4UL * 1024 * 1024)
-/* 4MB pool / 347B stride ~= 12085 blocks. A TLV of 257..504B occupies one L1
-   box alone (> 32 of 64 slots, still level 1), so 14000 values overflow the
-   pool. Head is 28B today. */
+/* A value near 500 bytes consumes one L1 box; 14000 boxes grow the pool. */
 #define HEAD_KEYS 14000
-#define HEAD_VAL_RAW 440
+#define HEAD_VAL_RAW 360
 /* 900KB = 29 slots of 32KB; the 2MB root has 64, so the third one re-roots. */
 #define BIG_RAW (900 * 1024)
 
@@ -35,9 +34,12 @@ static int set_bytes(kvspace_t *kv, const char *key, int32_t n, int seed) {
   for (int32_t j = 0; j < n; j++)
     raw[j] = (uint8_t)(seed + j);
   uint8_t *tlv;
-  int32_t dims[1] = {n};
-  int32_t len = kvspaceXvalueEncode(KVSPACE_KIND_UINT8, raw, n, dims, 1, &tlv);
-  int rc = kvspaceShmSet(kv, key, tlv, len);
+  uint64_t dims[1] = {(uint64_t)n}, len = 0;
+  if (kvspaceXhNewTensor(dims, 1, "uint8", raw, (uint64_t)n, &tlv, &len) != 0) {
+    free(raw);
+    return -1;
+  }
+  int rc = kvspaceShmSet(kv, key, tlv, (int32_t)len);
   free(tlv);
   free(raw);
   return rc;
@@ -49,11 +51,11 @@ static int check_bytes(kvspace_t *kv, const char *key, int32_t n, int seed) {
   uint8_t *d = kvspaceShmGet(kv, key, 1, &len);
   if (!d || len <= 0)
     return 1;
-  xvalue_head_t h = kvspaceXvalueDecodeHead(d, len);
-  if (h.raw_len != n)
+  kvspaceXh h;
+  if (kvspaceXhDecode(d, (uint64_t)len, &h) != 0 || h.content_len != (uint64_t)n)
     return 2;
   for (int32_t j = 0; j < n; j++)
-    if (h.raw[j] != (uint8_t)(seed + j))
+    if (h.body[j] != (uint8_t)(seed + j))
       return 3;
   return 0;
 }

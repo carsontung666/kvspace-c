@@ -1,6 +1,6 @@
 #define _GNU_SOURCE
 #include "kvspace_shm.h"
-#include "xvalue.h"
+#include "xvalue_head.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -20,10 +20,10 @@ static int failures;
 
 static int set_i64(kvspace_t *kv, const char *key, int64_t v) {
   uint8_t *tlv;
-  int32_t n = kvspaceXvalueNewInt64(&v, 1, &tlv);
-  if (n < 0)
+  uint64_t n = 0;
+  if (kvspaceXhNewScalar("int64", (const uint8_t *)&v, 8, &tlv, &n) != 0)
     return -1;
-  int rc = kvspaceShmSet(kv, key, tlv, n);
+  int rc = kvspaceShmSet(kv, key, tlv, (int32_t)n);
   free(tlv);
   return rc;
 }
@@ -31,8 +31,12 @@ static int set_i64(kvspace_t *kv, const char *key, int64_t v) {
 static int64_t get_i64(const uint8_t *d, int32_t len) {
   if (!d || len <= 0)
     return -999;
-  xvalue_head_t h = kvspaceXvalueDecodeHead(d, len);
-  return h.raw_len == 8 ? kvspaceXvalueRawInt64(h.raw) : -999;
+  kvspaceXh h;
+  if (kvspaceXhDecode(d, (uint64_t)len, &h) != 0 || h.content_len != 8)
+    return -999;
+  uint64_t v = 0;
+  for (int i = 0; i < 8; i++) v |= (uint64_t)h.body[i] << (i * 8);
+  return (int64_t)v;
 }
 
 static uint64_t nsec(void) {
@@ -90,13 +94,14 @@ int main(void) {
   CHECK(kvspaceShmResolveRef(kv, "/p", &pr) == 0);
   d = kvspaceShmGet(kv, "/p", 0, &len);
   CHECK(d && len > 8);
-  xvalue_head_t hh = kvspaceXvalueDecodeHead(d, len);
+  kvspaceXh hh;
+  CHECK(kvspaceXhDecode(d, (uint64_t)len, &hh) == 0);
   int64_t nv = 200;
   uint8_t raw[8];
   for (int i = 0; i < 8; i++)
     raw[i] = (uint8_t)((uint64_t)nv >> (8 * i));
   CHECK(kvspaceShmSetPartByRef(kv, &pr, "/p",
-                               (uint32_t)kvspaceXvalueHeadLen(&hh), raw,
+                               hh.headlen, raw,
                                8) == 0);
   d = kvspaceShmGetByRef(kv, &pr, "/p", &len);
   CHECK(get_i64(d, len) == 200);

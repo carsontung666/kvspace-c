@@ -34,17 +34,17 @@ Two surfaces:
 
 ## XValue
 
-kindexpr TLV head, byte-identical to `kvspace-durable` (`include/kvspace/xvalue.h`):
+kindexpr XValue uses the headlenpow wire format:
 
 ```
-[1B kindexprlen][kindexpr + 0x00 pad][1B ro][4B vid LE][4B raw_len LE][raw]
+[pow:u8][flags:u8][a:u64le][b:u64le][langtype, padded to 2^pow][body]
 ```
 
-- kindexpr first byte: `*` = soft link (raw = target path), `@` = ext handle, otherwise inline.
-- `[d0,d1]kind` carries ndim+dims; bare `kind` is a scalar; `char/*` is always a 1-D sequence (`[n]`).
-- `None` is encoded as NULL / length 0.
+- The low two flag bits select fixed, sized, tensor, or extension storage; bit 2 marks a pointer.
+- Directory members come from physical key prefixes. `@ext` stores its locator in class 3.
+- `ro` and `vid` live at `/.kvspace-meta/<hex-encoded key>`.
 
-Kinds: `bool`, `int8..int64`, `uint8..uint64`, `float32/64`, `char/utf32|utf8|ascii`, `stringkeymap`, `index`, `extindex`, `rwir`, `rwfunc`, `defrwir`, `scope`, `time`, `duration`.
+The codec accepts `None`, scalars, sized byte and character arrays, tensors, maps, and code values.
 
 ## Tutorial
 
