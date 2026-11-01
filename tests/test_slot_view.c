@@ -56,7 +56,7 @@ int main(void) {
     kvspaceXvalueBodyView_t nv;
     CHECK(kvspaceShmXvalueBodyView(kv, &r, NULL, &nv) == -1);
 
-    /* status：短值 / 16B 合法，17B 与异型硬错。 */
+    /* status: short / 16B values succeed via CoW >=80B boxes; identical overwrites reuse box. */
     const char *sk = "/vthread/7/\xE2\x80\xA5status";
     v = slack("init", &n);
     CHECK(v != NULL);
@@ -65,9 +65,16 @@ int main(void) {
     memset(&r, 0, sizeof r);
     CHECK(kvspaceShmResolveRef(kv, sk, &r) == 0);
     CHECK(kvspaceShmXvalueBodyView(kv, &r, sk, &view) == 0);
+    CHECK(view.headlen == KVSPACE_XVALUE_HEAD_LEN);
+    CHECK(view.body_cap >= 16);
+
+    v = slack("running", &n);
+    CHECK(v != NULL);
+    CHECK(kvspaceShmSet(kv, sk, v, (int32_t)n) == 0);
+    free(v);
+    CHECK(kvspaceShmXvalueBodyView(kv, &r, sk, &view) == 0);
     uint8_t *head0 = view.head, *body0 = view.body;
     uint64_t cap0 = view.cap;
-    CHECK(view.headlen == KVSPACE_XVALUE_HEAD_LEN);
     CHECK(view.body_cap >= 16);
 
     for (int i = 0; i < 100000; i++) {

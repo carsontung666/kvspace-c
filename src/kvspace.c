@@ -147,8 +147,10 @@ enum { GE_EMPTY = 0, GE_RESERVED = 1, GE_COMMITTED = 2 };
  * <path>.sbo.data  [sbo data ...] */
 typedef struct {
     char magic[12];
+    int32_t pending_moved_old; /* Crash journal: node replaced in flight (-1 if none) */
     uint64_t art_slab_size, sbo_head_size, sbo_data_size;
     int32_t art_root;
+    int32_t pending_moved_to;  /* Crash journal: clone/grown replacement id (-1 if none) */
     /* v3: 旁路 gen 表（节点 id 索引，8B/节点）。 */
     uint64_t gens_size;
     uint64_t gen_epoch;        /* 节点分配 epoch（原子递增） */
@@ -156,7 +158,8 @@ typedef struct {
     uint32_t recovery_epoch;   /* 屏障轮次（u32，模比较） */
     uint32_t ack_seq;          /* 跨进程 futex 字（第 3 步） */
     uint32_t barrier_state;
-    uint64_t barrier_pid, barrier_starttime;
+    uint64_t pending_moved_par; /* Crash journal: (uint64_t)(uint32_t)parent_id | ((uint64_t)byte << 32), or UINT64_MAX for root */
+    uint64_t pending_unused;
     uint64_t garb_cap, garb_head, garb_tail;
     uint64_t committed_bytes;  /* 只由写者改（单写者契约，普通 add） */
     uint64_t freed_bytes;      /* 只由 leader 改 */
@@ -166,8 +169,15 @@ typedef struct {
      * or disappears (delete/tombstone) to invalidate per-handle List caches across processes. */
     uint64_t list_gen;
     uint32_t claim_seq;        /* 30 位发号；耗尽 open 硬失败 */
+    uint32_t write_lock;       /* Cross-process writer spinlock (PID-owned, crash-recoverable) */
     p2_slot_t slots[P2_SLOT_N];
 } kvspace_hdr_t;
+
+_Static_assert(sizeof(kvspace_hdr_t) == 2232, "kvspace_hdr_t size must stay 2232 bytes");
+_Static_assert(offsetof(kvspace_hdr_t, art_slab_size) == 16, "art_slab_size offset unchanged");
+_Static_assert(offsetof(kvspace_hdr_t, gens_size) == 48, "gens_size offset unchanged");
+_Static_assert(offsetof(kvspace_hdr_t, garb_cap) == 96, "garb_cap offset unchanged");
+_Static_assert(offsetof(kvspace_hdr_t, write_lock) == 180, "write_lock offset unchanged");
 
 #define ART_OFF (sizeof(kvspace_hdr_t) + sizeof(blocks_meta_t))
 
@@ -252,6 +262,36 @@ struct kvspace {
  * Ptr/@ext value changes do not bump this since list_cached re-checks target and mount each call. */
 static inline void list_gen_bump(kvspace_t *kv) {
     __atomic_add_fetch(&kv->hdr->list_gen, 1ull, __ATOMIC_RELEASE);
+}
+
+static void kv_repair_pending_move(kvspace_t *kv);
+
+static inline void kv_write_lock(kvspace_t *kv) {
+    uint32_t me = (uint32_t)sbo_self_pid();
+    for (;;) {
+        uint32_t e = 0;
+        if (__atomic_compare_exchange_n(&kv->hdr->write_lock, &e, me, true,
+                                        __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+            return;
+        for (int spin = 0; spin < 4096; spin++) {
+            sbo_cpu_relax();
+            if (__atomic_load_n(&kv->hdr->write_lock, __ATOMIC_RELAXED) == 0)
+                break;
+        }
+        uint32_t owner = __atomic_load_n(&kv->hdr->write_lock, __ATOMIC_ACQUIRE);
+        if (owner > 0 && owner != me && sbo_pid_dead((int)owner)) {
+            if (__atomic_compare_exchange_n(&kv->hdr->write_lock, &owner, me,
+                                            false, __ATOMIC_ACQ_REL,
+                                            __ATOMIC_RELAXED)) {
+                kv_repair_pending_move(kv);
+                return;
+            }
+        }
+    }
+}
+
+static inline void kv_write_unlock(kvspace_t *kv) {
+    __atomic_store_n(&kv->hdr->write_lock, 0u, __ATOMIC_RELEASE);
 }
 
 /* ---- shm region ---- */
@@ -345,6 +385,8 @@ static int64_t gen_alloc_epoch(kvspace_t *kv) {
 }
 
 static int p2_maint_start(kvspace_t *kv);   /* 懒启动（阈值触发） */
+static int p2_round(kvspace_t *kv);
+static void p2_futex_wake_priv(uint32_t *addr);
 static bool p2_claim_alive(kvspace_t *kv, uint32_t claim);
 static int kv_sync(kvspace_t *kv);
 static void list_cache_drop(kvspace_t *kv);
@@ -391,6 +433,11 @@ static int garb_reserve(kvspace_t *kv, uint64_t *idx) {
         return -1;
     uint64_t h = __atomic_load_n(&kv->hdr->garb_head, __ATOMIC_ACQUIRE);
     uint64_t t = __atomic_load_n(&kv->hdr->garb_tail, __ATOMIC_ACQUIRE);
+    if (t - h >= kv->hdr->garb_cap - 1024 && kv->quiesced) {
+        (void)p2_round(kv);
+        h = __atomic_load_n(&kv->hdr->garb_head, __ATOMIC_ACQUIRE);
+        t = __atomic_load_n(&kv->hdr->garb_tail, __ATOMIC_ACQUIRE);
+    }
     if (t - h >= kv->hdr->garb_cap) {
         garb_full_report(kv);
         return -1;
@@ -426,11 +473,17 @@ static void garb_commit(kvspace_t *kv, uint64_t idx, uint64_t off,
     e->off = off;
     e->epoch = __atomic_load_n(&kv->hdr->recovery_epoch, __ATOMIC_ACQUIRE);
     __atomic_store_n(&e->meta, GE_MAKE(GE_COMMITTED, claim), __ATOMIC_RELEASE);
-    uint64_t bytes = kv->hdr->committed_bytes + bytes_retired;
-    __atomic_store_n(&kv->hdr->committed_bytes, bytes, __ATOMIC_RELEASE);
+    uint64_t bytes = __atomic_add_fetch(&kv->hdr->committed_bytes,
+                                        bytes_retired, __ATOMIC_RELEASE);
+    uint64_t h = __atomic_load_n(&kv->hdr->garb_head, __ATOMIC_ACQUIRE);
+    uint64_t t = __atomic_load_n(&kv->hdr->garb_tail, __ATOMIC_ACQUIRE);
     if (bytes - __atomic_load_n(&kv->hdr->freed_bytes, __ATOMIC_ACQUIRE) >=
-        p2_garb_threshold())
+            p2_garb_threshold() ||
+        t - h >= kv->hdr->garb_cap / 4) {
         (void)p2_maint_start(kv);    /* 失败已置 reclaim_unavailable */
+        __atomic_add_fetch(&kv->maint_seq, 1u, __ATOMIC_RELEASE);
+        p2_futex_wake_priv(&kv->maint_seq);
+    }
 }
 
 static void garb_cancel(kvspace_t *kv, uint64_t idx) {
@@ -675,6 +728,8 @@ int kvspaceShmViewFromRef(kvspace_t *kv, const kvspaceRef_t *ref,
     (void)key_fallback;
     if (!kv || !ref || !tok || ref->gen != 0 || P2_VIEW_GUARD(kv))
         return -1;
+    if (kv_sync(kv) != 0)
+        return -1;
     int32_t id = art_follow(kv, (int32_t)ref->block_id);
     art_hdr_t *h = id >= 0 ? art_hdr(kv, id) : NULL;
     if (!h)
@@ -721,6 +776,8 @@ int kvspaceShmViewResolve(kvspace_t *kv, const char *key, kvspaceViewToken_t *to
 int kvspaceShmResolvePrefix(kvspace_t *kv, const char *path, kvspaceRef_t *ref) {
     if (!kv || !path || !ref || P2_VIEW_GUARD(kv))
         return -1;
+    if (kv_sync(kv) != 0)
+        return -1;
     memset(ref, 0, sizeof(*ref));
     int klen = (int)strlen(path);
     int d = 0;
@@ -755,6 +812,8 @@ int kvspaceShmViewResolveFrom(kvspace_t *kv, const kvspaceRef_t *parent,
                               const char *rel, kvspaceViewToken_t *tok) {
     if (!kv || !parent || !rel || !tok || P2_VIEW_GUARD(kv))
         return -1;
+    if (kv_sync(kv) != 0)
+        return -1;
     int32_t pid = art_follow(kv, (int32_t)parent->block_id);
     art_hdr_t *ph = pid >= 0 ? art_hdr(kv, pid) : NULL;
     if (!ph)
@@ -763,6 +822,8 @@ int kvspaceShmViewResolveFrom(kvspace_t *kv, const kvspaceRef_t *parent,
     const uint8_t *p = (const uint8_t *)rel;
     int rem = (int)strlen(rel);
     int32_t covered = (int32_t)parent->depth;
+    if (covered < 0 || covered > (int32_t)ph->prefix_len)
+        return -1;
     while (covered < (int32_t)ph->prefix_len && rem > 0) {
         if (p[0] != ph->prefix[covered])
             return -1;
@@ -806,26 +867,71 @@ int kvspaceShmViewCheck(kvspace_t *kv, const kvspaceViewToken_t *tok) {
     return 0;
 }
 
-/* Hot-path write: in-place same-length body write. Returns 0 on success, 1 to fall back.
- * The attr region immediately follows body (at 8+len), so only writes matching the current
- * header len are accepted; variable-length writes fall back to full-value write. */
+static inline bool shm_write_body_atomic(uint8_t *dst, const uint8_t *src,
+                                         uint32_t len) {
+    if (len == 0)
+        return true;
+    if (len == 1) {
+        __atomic_store_n(dst, src[0], __ATOMIC_RELEASE);
+        return true;
+    }
+    if (len == 2 && (((uintptr_t)dst & 1u) == 0)) {
+        uint16_t v;
+        memcpy(&v, src, 2);
+        __atomic_store_n((uint16_t *)dst, v, __ATOMIC_RELEASE);
+        return true;
+    }
+    if (len == 4 && (((uintptr_t)dst & 3u) == 0)) {
+        uint32_t v;
+        memcpy(&v, src, 4);
+        __atomic_store_n((uint32_t *)dst, v, __ATOMIC_RELEASE);
+        return true;
+    }
+    if (len == 8 && (((uintptr_t)dst & 7u) == 0)) {
+        uint64_t v;
+        memcpy(&v, src, 8);
+        __atomic_store_n((uint64_t *)dst, v, __ATOMIC_RELEASE);
+        return true;
+    }
+    return false;
+}
+
+static inline bool shm_can_write_atomic(const uint8_t *dst, uint32_t len) {
+    return len <= 1 ||
+           (len == 2 && (((uintptr_t)dst & 1u) == 0)) ||
+           (len == 4 && (((uintptr_t)dst & 3u) == 0)) ||
+           (len == 8 && (((uintptr_t)dst & 7u) == 0));
+}
+
+/* Hot-path write: in-place same-length scalar body write. Returns 0 on success, 1 to fall back.
+ * Only single-instruction aligned 1/2/4/8-byte writes are done in place; wider writes fall back
+ * to CoW SetValue so SIGKILL cannot tear multi-word payloads. */
 int kvspaceShmViewWrite(kvspace_t *kv, kvspaceViewToken_t *tok,
                         const uint8_t *data, uint32_t len) {
-    if (!kv || P2_VIEW_GUARD(kv))
+    if (!kv || !tok || (len && !data) || P2_VIEW_GUARD(kv))
         return -1;
-    if (kvspaceShmViewCheck(kv, tok) != 0)
+    if (!shm_can_write_atomic(tok->body, len))
         return 1;
+    kv_write_lock(kv);
+    if (kvspaceShmViewCheck(kv, tok) != 0) {
+        kv_write_unlock(kv);
+        return 1;
+    }
     kvspaceXvalueHead cur;
     memcpy(&cur, tok->head, sizeof cur);
-    if ((uint64_t)len != kvspaceXvalueHeadLen(&cur) || len > tok->body_cap)
+    if ((uint64_t)len != kvspaceXvalueHeadLen(&cur) || len > tok->body_cap) {
+        kv_write_unlock(kv);
         return 1;
+    }
     kv_gens_t *g = gens_at(kv, (int32_t)tok->node_id);
-    if (!g)
+    if (!g) {
+        kv_write_unlock(kv);
         return 1;
-    __atomic_add_fetch(&g->value_gen, 1u, __ATOMIC_ACQ_REL); /* 奇：写中 */
-    memcpy(tok->body, data, len);
-    __atomic_add_fetch(&g->value_gen, 1u, __ATOMIC_ACQ_REL); /* 偶：写完 */
+    }
+    (void)shm_write_body_atomic(tok->body, data, len);
+    __atomic_add_fetch(&g->value_gen, 2u, __ATOMIC_ACQ_REL);
     tok->value_len = len;
+    kv_write_unlock(kv);
     return 0;
 }
 
@@ -843,9 +949,17 @@ int kvspaceShmViewDel(kvspace_t *kv, kvspaceViewToken_t *tok, const char *key) {
     uint64_t hv = art_val_load(h);
     if (!AV_HAS(hv))
         return 1;
+    kv_write_lock(kv);
+    hv = art_val_load(h);
+    if (!AV_HAS(hv)) {
+        kv_write_unlock(kv);
+        return 1;
+    }
     uint64_t gidx;
-    if (garb_reserve(kv, &gidx) != 0)
+    if (garb_reserve(kv, &gidx) != 0) {
+        kv_write_unlock(kv);
         return -1;                      /* 表满：硬错误，未变更 */
+    }
 #ifdef P2_TEST_HOOKS
     {
         const char *v = getenv("P2_TEST_HOLD_DELCAS_MS");
@@ -855,10 +969,12 @@ int kvspaceShmViewDel(kvspace_t *kv, kvspaceViewToken_t *tok, const char *key) {
 #endif
     if (!art_val_cas(h, &hv, 0)) {
         garb_cancel(kv, gidx);
+        kv_write_unlock(kv);
         return 1;
     }
     __atomic_add_fetch(&g->value_gen, 2u, __ATOMIC_ACQ_REL); /* 静止态保持偶数 */
     garb_commit(kv, gidx, AV_OFF(hv), tok->cap);
+    kv_write_unlock(kv);
     list_gen_bump(kv);                  /* bump after key removal */
     (void)key;
     return 0;
@@ -1008,6 +1124,8 @@ static bool p2_wait_acks(kvspace_t *kv, uint32_t r, int deadline_ms) {
  * COMMITTED 且 epoch < r 才释放（cap 在 free 之前取）。 */
 static int p2_drain(kvspace_t *kv, uint32_t r) {
     int freed = 0;
+    if (kv_sync(kv) != 0)
+        return 0;
     uint64_t i = __atomic_load_n(&kv->hdr->garb_head, __ATOMIC_ACQUIRE);
     for (;;) {
         /* 环尾之外是未写条目：到 tail 必须停，否则会把 head 推过 tail
@@ -1039,6 +1157,8 @@ static int p2_drain(kvspace_t *kv, uint32_t r) {
         if (!((int32_t)(r - __atomic_load_n(&e->epoch, __ATOMIC_ACQUIRE)) > 0))
             goto out;                 /* 未到轮次 */
         uint64_t off = __atomic_load_n(&e->off, __ATOMIC_ACQUIRE);
+        if (off >= kv->r_data.mapped && kv_sync(kv) != 0)
+            goto out;
         uint64_t cap = sbo_allocated_size(kv->sbo_meta, off);  /* free 之前取 */
         __atomic_store_n(&kv->hdr->garb_freeing, off, __ATOMIC_RELEASE);
         __atomic_store_n(&e->meta, GE_EMPTY, __ATOMIC_RELEASE);
@@ -1120,9 +1240,12 @@ static void *p2_maint(void *arg) {
         p2_futex_wait_priv(&kv->maint_seq, seq, 50);
         if (__atomic_load_n(&kv->maint_stop, __ATOMIC_ACQUIRE))
             break;
+        uint64_t h = __atomic_load_n(&kv->hdr->garb_head, __ATOMIC_ACQUIRE);
+        uint64_t t = __atomic_load_n(&kv->hdr->garb_tail, __ATOMIC_ACQUIRE);
         if (kv->hdr->committed_bytes -
-                __atomic_load_n(&kv->hdr->freed_bytes, __ATOMIC_ACQUIRE) <
-            p2_garb_threshold())
+                    __atomic_load_n(&kv->hdr->freed_bytes, __ATOMIC_ACQUIRE) <
+                p2_garb_threshold() &&
+            t - h < kv->hdr->garb_cap / 4)
             continue;
         p2_round(kv);                 /* 内含选举；忙/超时都直接返回 */
     }
@@ -1257,27 +1380,91 @@ int kvspaceShmViewRefresh(kvspace_t *kv, kvspaceViewToken_t *tok, const char *ke
     return 0;
 }
 
+static void kv_reconcile_sizes(kvspace_t *kv) {
+    struct stat st;
+    uint64_t art_tot = __atomic_load_n(&kv->art_meta->total_size, __ATOMIC_ACQUIRE);
+    uint64_t hdr_art = __atomic_load_n(&kv->hdr->art_slab_size, __ATOMIC_ACQUIRE);
+    if (art_tot > hdr_art &&
+        fstat(kv->r_art.fd, &st) == 0 &&
+        (uint64_t)st.st_size >= ART_OFF + art_tot) {
+        __atomic_store_n(&kv->hdr->art_slab_size, art_tot, __ATOMIC_RELEASE);
+    }
+    sbo_meta_t *m = kv->sbo_meta;
+    if (m->root_slots == 1) {
+        blocks_meta_t *p = sbo_pool(m);
+        uint64_t ptot = __atomic_load_n(&p->total_size, __ATOMIC_ACQUIRE);
+        uint64_t psm = __atomic_load_n(&m->per_slot_meta, __ATOMIC_ACQUIRE);
+        uint64_t pm = ptot > psm ? ptot : psm;
+        uint64_t hdr_head = __atomic_load_n(&kv->hdr->sbo_head_size, __ATOMIC_ACQUIRE);
+        if (SBO_HEAD_FIXED + pm > hdr_head &&
+            fstat(kv->r_head.fd, &st) == 0 &&
+            (uint64_t)st.st_size >= SBO_HEAD_FIXED + pm) {
+            __atomic_store_n(&m->per_slot_meta, pm, __ATOMIC_RELEASE);
+            __atomic_store_n(&m->max_blocks, (uint32_t)(pm / m->block_stride),
+                             __ATOMIC_RELEASE);
+            __atomic_store_n(&kv->hdr->sbo_head_size, SBO_HEAD_FIXED + pm,
+                             __ATOMIC_RELEASE);
+        }
+        uint8_t cur_shift = __atomic_load_n(&m->slot_shift, __ATOMIC_ACQUIRE);
+        uint64_t mdata0 = __atomic_load_n(&m->data_size, __ATOMIC_ACQUIRE);
+        uint8_t want_lvl =
+            (uint8_t)(sbo_align_to((1ULL << cur_shift) >> 3).level - 1);
+        sbo_box_t *root = sbo_box(m, 0);
+        uint32_t gnid = __atomic_load_n(&sbo_plock(m)->grow_nid, __ATOMIC_ACQUIRE);
+        uint8_t root_lvl = __atomic_load_n(&root->objlevel, __ATOMIC_ACQUIRE);
+        if ((gnid != 0 || root_lvl == (uint8_t)(want_lvl + 1)) &&
+            cur_shift + SBO_N_BITS < 64) {
+            uint64_t want_data = 1ULL << (cur_shift + SBO_N_BITS);
+            if (fstat(kv->r_data.fd, &st) == 0 &&
+                (uint64_t)st.st_size >= want_data) {
+                sbo_lock_shard(m, 0);
+                sbo_unlock(sbo_plock(m));
+            }
+        } else if (cur_shift >= 9 && cur_shift < 64 &&
+                   (mdata0 >> cur_shift) != 1) {
+            uint64_t want_data = 1ULL << cur_shift;
+            if (fstat(kv->r_data.fd, &st) == 0 &&
+                (uint64_t)st.st_size >= want_data) {
+                sbo_lock_shard(m, 0);
+                sbo_unlock(sbo_plock(m));
+            }
+        }
+        uint64_t mdata = __atomic_load_n(&m->data_size, __ATOMIC_ACQUIRE);
+        uint64_t hdr_data = __atomic_load_n(&kv->hdr->sbo_data_size, __ATOMIC_ACQUIRE);
+        if (mdata > hdr_data &&
+            fstat(kv->r_data.fd, &st) == 0 &&
+            (uint64_t)st.st_size >= mdata) {
+            __atomic_store_n(&kv->hdr->sbo_data_size, mdata, __ATOMIC_RELEASE);
+        }
+    }
+}
+
 static int kv_sync(kvspace_t *kv) {
-    if (region_map(&kv->r_art, ART_OFF + (size_t)kv->hdr->art_slab_size) != 0)
+    kv_reconcile_sizes(kv);
+    size_t art_sz = (size_t)__atomic_load_n(&kv->hdr->art_slab_size, __ATOMIC_ACQUIRE);
+    if (region_map(&kv->r_art, ART_OFF + art_sz) != 0)
         return -1;
-    /* 别的进程可能扩过 ART slab：本进程 gens 映射同步跟到同一容量。 */
-    if (kv->art_meta->total_size != kv->art_total_seen &&
+    /* Grow local gens mapping when another process expanded the ART slab. */
+    if (__atomic_load_n(&kv->art_meta->total_size, __ATOMIC_ACQUIRE) !=
+            kv->art_total_seen &&
         gens_grow(kv) != 0)
         return -1;
-    if (region_map(&kv->r_head, (size_t)kv->hdr->sbo_head_size) != 0)
+    size_t head_sz = (size_t)__atomic_load_n(&kv->hdr->sbo_head_size, __ATOMIC_ACQUIRE);
+    if (region_map(&kv->r_head, head_sz) != 0)
         return -1;
-    return region_map(&kv->r_data, (size_t)kv->hdr->sbo_data_size);
+    size_t data_sz = (size_t)__atomic_load_n(&kv->hdr->sbo_data_size, __ATOMIC_ACQUIRE);
+    return region_map(&kv->r_data, data_sz);
 }
 
 /* blockmalloc only checks total_size; grow the file before publishing it. */
 static int art_slab_grow(kvspace_t *kv) {
-    size_t want = (size_t)kv->hdr->art_slab_size * 2;
+    size_t want = (size_t)__atomic_load_n(&kv->hdr->art_slab_size, __ATOMIC_ACQUIRE) * 2;
     if (ART_OFF + want > kv->r_art.reserve ||
         ftruncate(kv->r_art.fd, (off_t)(ART_OFF + want)) != 0 ||
         region_map(&kv->r_art, ART_OFF + want) != 0)
         return -1;
-    kv->hdr->art_slab_size = want;
-    kv->art_meta->total_size = want;
+    __atomic_store_n(&kv->art_meta->total_size, want, __ATOMIC_RELEASE);
+    __atomic_store_n(&kv->hdr->art_slab_size, want, __ATOMIC_RELEASE);
     return 0;
 }
 
@@ -1316,10 +1503,12 @@ static int sbo_head_grow(kvspace_t *kv) {
         ftruncate(kv->r_head.fd, (off_t)(SBO_HEAD_FIXED + want)) != 0 ||
         region_map(&kv->r_head, SBO_HEAD_FIXED + (size_t)want) != 0)
         return -1;
-    p->total_size = want;
-    m->per_slot_meta = want;
-    m->max_blocks = (uint32_t)(want / m->block_stride);
-    kv->hdr->sbo_head_size = SBO_HEAD_FIXED + want;
+    __atomic_store_n(&p->total_size, want, __ATOMIC_RELEASE);
+    __atomic_store_n(&m->per_slot_meta, want, __ATOMIC_RELEASE);
+    __atomic_store_n(&m->max_blocks, (uint32_t)(want / m->block_stride),
+                     __ATOMIC_RELEASE);
+    __atomic_store_n(&kv->hdr->sbo_head_size, SBO_HEAD_FIXED + want,
+                     __ATOMIC_RELEASE);
     return 0;
 }
 
@@ -1353,21 +1542,29 @@ static int sbo_data_grow(kvspace_t *kv) {
     uint8_t old_lvl = b->objlevel;
     if (old_lvl >= 1 && old_lvl <= 3 && lk->hot_id1[old_lvl - 1] == 1)
         lk->hot_id1[old_lvl - 1] = (uint32_t)nid + 1;
+    /* Journal nid before mutating root so sbo_repair_shard can finish the split on crash. */
+    __atomic_store_n(&lk->grow_nid, (uint32_t)nid, __ATOMIC_RELEASE);
     uint8_t lvl = (uint8_t)(old_lvl + 1);
     sbo_box_format(root, lvl, -1, 255, 0);
+#ifdef P2_TEST_HOOKS
+    if (getenv("P2_TEST_DIE_GROW_SPLIT"))
+        _exit(99);
+#endif
+    root->children[0] = (int32_t)nid;
+    root->states[0] = SBO_BOX;
     root->free_mask = ~1ULL;
     root->child_mask = 1ULL;
-    root->states[0] = SBO_BOX;
-    root->children[0] = (int32_t)nid;
     uint16_t b_comb = sbo_combined(b);
     root->child_cap[0] = b_comb;
     root->child_max_enc = b_comb;
     root->child_max_count = 1;
     root->max_obj_cap = SBO_MULT_MAX;
     root->hint_child = 0;
-    m->data_size = want;
-    m->slot_shift = (uint8_t)__builtin_ctzll(want);
-    kv->hdr->sbo_data_size = want;
+    __atomic_store_n(&m->slot_shift, (uint8_t)__builtin_ctzll(want),
+                     __ATOMIC_RELEASE);
+    __atomic_store_n(&m->data_size, want, __ATOMIC_RELEASE);
+    __atomic_store_n(&kv->hdr->sbo_data_size, want, __ATOMIC_RELEASE);
+    __atomic_store_n(&lk->grow_nid, 0u, __ATOMIC_RELEASE);
     return 0;
 }
 
@@ -1375,7 +1572,7 @@ static int sbo_data_grow(kvspace_t *kv) {
    trylock contention), so re-root only after two failures at one capacity. */
 static int kv_sbo_grow(kvspace_t *kv, bool failed, uint64_t *seen_data) {
     sbo_meta_t *m = kv->sbo_meta;
-    sbo_lock(sbo_plock(m));
+    sbo_lock_shard(m, 0);
     int rc = 0;
     if (sbo_pool_full(m))
         rc = sbo_head_grow(kv);
@@ -1473,7 +1670,8 @@ static bool bm_layout_ok(void) {
 }
 static int64_t art_bump(kvspace_t *kv, uint32_t k) {
     blocks_meta_t *m = kv->art_meta;
-    spin_lock(&m->lock);
+    if (spin_lock_ex(&m->lock))
+        m->used_blocks = BM_MALLOC_BLOCKS(m);
     uint64_t id = BM_MALLOC_BLOCKS(m);
     if ((uint64_t)block_offset(m, id + k) > m->total_size) {
         spin_unlock(&m->lock);
@@ -1713,9 +1911,143 @@ static int32_t art_new_node(kvspace_t *kv, int t) {
     return id;
 }
 
+static void art_mark_moved(kvspace_t *kv, int32_t old_id, int32_t new_id) {
+    if (old_id < 0 || new_id < 0)
+        return;
+    art_hdr_t *oh = art_hdr(kv, old_id);
+    if (!oh)
+        return;
+    gen_bump_struct(kv, new_id);
+    gen_bump_struct(kv, old_id);
+    art_val_store(oh, AV_MAKE(0, (uint32_t)new_id));
+    __atomic_store_n(&oh->type, (uint8_t)ART_MOVED, __ATOMIC_RELEASE);
+}
+
+static inline void kv_journal_move_begin(kvspace_t *kv, int32_t old_id,
+                                         int32_t new_id, int32_t parent_id,
+                                         uint8_t edge) {
+    if (old_id < 0 || new_id < 0)
+        return;
+    uint64_t par = parent_id < 0
+                       ? UINT64_MAX
+                       : ((uint64_t)(uint32_t)parent_id | ((uint64_t)edge << 32));
+    __atomic_store_n(&kv->hdr->pending_moved_to, new_id, __ATOMIC_RELAXED);
+    __atomic_store_n(&kv->hdr->pending_moved_par, par, __ATOMIC_RELAXED);
+    __atomic_store_n(&kv->hdr->pending_moved_old, old_id, __ATOMIC_RELEASE);
+}
+
+static inline void kv_journal_move_end(kvspace_t *kv) {
+    __atomic_store_n(&kv->hdr->pending_moved_old, -1, __ATOMIC_RELEASE);
+}
+
+/* Complete art_mark_moved if a dead writer crashed after swapping parent/root
+ * pointer to the new subtree but before marking old_id as ART_MOVED. */
+static void kv_repair_pending_move(kvspace_t *kv) {
+    int32_t old_id = __atomic_load_n(&kv->hdr->pending_moved_old, __ATOMIC_ACQUIRE);
+    if (old_id < 0)
+        return;
+    int32_t new_id = __atomic_load_n(&kv->hdr->pending_moved_to, __ATOMIC_RELAXED);
+    uint64_t par = __atomic_load_n(&kv->hdr->pending_moved_par, __ATOMIC_RELAXED);
+    if (kv_sync(kv) == 0 && new_id >= 0) {
+        art_hdr_t *oh = art_hdr(kv, old_id);
+        if (oh && oh->type != ART_MOVED) {
+            bool unlinked = false;
+            if (par == UINT64_MAX) {
+                unlinked = (__atomic_load_n(&kv->hdr->art_root, __ATOMIC_ACQUIRE) != old_id);
+            } else {
+                int32_t pid = (int32_t)(uint32_t)par;
+                uint8_t edge = (uint8_t)(par >> 32);
+                art_hdr_t *ph = art_hdr(kv, pid);
+                if (ph && ph->type != ART_MOVED)
+                    unlinked = (art_child(kv, ph, edge) != old_id);
+            }
+            if (unlinked)
+                art_mark_moved(kv, old_id, new_id);
+        }
+    }
+    __atomic_store_n(&kv->hdr->pending_moved_old, -1, __ATOMIC_RELEASE);
+}
+
+static int32_t art_clone_node_shortened(kvspace_t *kv, int32_t oid, int drop_prefix) {
+    art_hdr_t *oh = art_hdr(kv, oid);
+    if (!oh || drop_prefix > (int)oh->prefix_len)
+        return -1;
+    int t = oh->type;
+    int32_t cid = art_new_node(kv, t);
+    if (cid < 0)
+        return -1;
+    oh = art_hdr(kv, oid);
+    void *dst = art_blk(kv, cid);
+    memcpy(dst, oh, (size_t)art_node_sz(t));
+    art_hdr_t *ch = (art_hdr_t *)dst;
+    uint8_t rem = (uint8_t)(oh->prefix_len - (uint8_t)drop_prefix);
+    ch->prefix_len = rem;
+    if (rem > 0)
+        memmove(ch->prefix, oh->prefix + drop_prefix, rem);
+    return cid;
+}
+
+static int art_replace_child(kvspace_t *kv, void *n, uint8_t b, int32_t nc) {
+    gen_bump_struct(kv, art_id_of(kv, n));
+    art_hdr_t *h = n;
+    switch (h->type) {
+    case ART_N4: {
+        art_n4_t *x = n;
+        for (int i = 0; i < (int)h->count; i++)
+            if (x->keys[i] == b) {
+                __atomic_store_n(&x->children[i], nc, __ATOMIC_RELEASE);
+                return 0;
+            }
+        return -1;
+    }
+    case ART_N16: {
+        art_n16_t *x = n;
+        int lo = 0, hi = (int)h->count - 1;
+        while (lo <= hi) {
+            int m = (lo + hi) / 2;
+            if (x->keys[m] == b) {
+                __atomic_store_n(&x->children[m], nc, __ATOMIC_RELEASE);
+                return 0;
+            }
+            if (x->keys[m] < b)
+                lo = m + 1;
+            else
+                hi = m - 1;
+        }
+        return -1;
+    }
+    case ART_N48: {
+        art_n48_t *x = n;
+        uint8_t idx = x->index[b];
+        if (idx == 255)
+            return -1;
+        __atomic_store_n(&x->children[idx], nc, __ATOMIC_RELEASE);
+        return 0;
+    }
+    case ART_N256: {
+        art_n256_t *x = n;
+        __atomic_store_n(&x->children[b], nc, __ATOMIC_RELEASE);
+        return 0;
+    }
+    }
+    return -1;
+}
+
 /* ---- grow ---- */
-static int32_t art_grow(kvspace_t *kv, void *on) {
-    art_hdr_t *oh = on;
+static uint64_t art_n48_used_mask(const art_n48_t *x) {
+    uint64_t used = 0;
+    for (int i = 0; i < 256; i++) {
+        uint8_t idx = __atomic_load_n(&x->index[i], __ATOMIC_RELAXED);
+        if (idx < 48)
+            used |= 1ULL << idx;
+    }
+    return used;
+}
+
+static int32_t art_grow(kvspace_t *kv, int32_t oid) {
+    art_hdr_t *oh = art_hdr(kv, oid);
+    if (!oh)
+        return -1;
     int nt;
     if (oh->type == ART_N4)
         nt = ART_N16;
@@ -1728,10 +2060,26 @@ static int32_t art_grow(kvspace_t *kv, void *on) {
     int32_t nid = art_new_node(kv, nt);
     if (nid < 0)
         return -1;
+    oh = art_hdr(kv, oid);
+    void *on = oh;
     art_hdr_t *nh = art_hdr(kv, nid);
     nh->prefix_len = oh->prefix_len;
     memcpy(nh->prefix, oh->prefix, oh->prefix_len);
     art_val_store(nh, art_val_load(oh));
+    if (oh->type == ART_N48) {
+        art_n48_t *x = on;
+        art_n256_t *dst = (art_n256_t *)nh;
+        uint16_t cnt = 0;
+        for (int j = 0; j < 256; j++) {
+            uint8_t idx = x->index[j];
+            if (idx < 48) {
+                dst->children[j] = x->children[idx];
+                cnt++;
+            }
+        }
+        nh->count = cnt;
+        return nid;
+    }
     // copy children
     for (int i = 0; i < (int)oh->count; i++) {
         uint8_t b = 0;
@@ -1749,16 +2097,6 @@ static int32_t art_grow(kvspace_t *kv, void *on) {
             c = x->children[i];
             break;
         }
-        case ART_N48: {
-            art_n48_t *x = on;
-            c = x->children[i];
-            for (int j = 0; j < 256; j++)
-                if (x->index[j] == i) {
-                    b = (uint8_t)j;
-                    break;
-                }
-            break;
-        }
         }
         switch (nt) {
         case ART_N16: {
@@ -1771,10 +2109,6 @@ static int32_t art_grow(kvspace_t *kv, void *on) {
             art_n48_t *x = (art_n48_t *)nh;
             x->index[b] = (uint8_t)i;
             x->children[i] = c;
-            break;
-        }
-        case ART_N256: {
-            ((art_n256_t *)nh)->children[b] = c;
             break;
         }
         }
@@ -1793,13 +2127,6 @@ static int32_t art_grow(kvspace_t *kv, void *on) {
                     x->children[j] = tc;
                 }
     }
-    {   /* P2: 搬迁 —— 新节点 struct_gen = 旧 +1；旧节点也动一次 */
-        int32_t oid = art_id_of(kv, oh);
-        gen_bump_struct(kv, nid);   /* 新节点 gen 先抬一代 */
-        gen_bump_struct(kv, oid);   /* 旧节点也失效 */
-    }
-    oh->type = ART_MOVED;
-    art_val_store(oh, AV_MAKE(0, (uint32_t)nid));
     return nid;
 }
 
@@ -1812,9 +2139,10 @@ static int art_add(kvspace_t *kv, void *n, uint8_t b, int32_t cid) {
         if (h->count >= 4)
             return -1;
         art_n4_t *x = n;
-        x->keys[h->count] = b;
-        x->children[h->count] = cid;
-        h->count++;
+        uint16_t c = h->count;
+        x->children[c] = cid;
+        x->keys[c] = b;
+        __atomic_store_n(&h->count, (uint16_t)(c + 1), __ATOMIC_RELEASE);
         return 0;
     }
     case ART_N16: {
@@ -1827,27 +2155,37 @@ static int art_add(kvspace_t *kv, void *n, uint8_t b, int32_t cid) {
             x->children[p] = x->children[p - 1];
             p--;
         }
-        x->keys[p] = b;
         x->children[p] = cid;
-        h->count++;
+        x->keys[p] = b;
+        __atomic_store_n(&h->count, (uint16_t)(h->count + 1), __ATOMIC_RELEASE);
         return 0;
     }
     case ART_N48: {
-        if (h->count >= 48)
-            return -1;
         art_n48_t *x = n;
-        int s = (int)h->count;
-        x->index[b] = (uint8_t)s;
+        if (x->index[b] < 48)
+            return -1;
+        uint64_t used = art_n48_used_mask(x);
+        int cnt = __builtin_popcountll(used);
+        if (cnt >= 48) {
+            __atomic_store_n(&h->count, 48u, __ATOMIC_RELEASE);
+            return -1;
+        }
+        int s = __builtin_ctzll(~used);
         x->children[s] = cid;
-        h->count++;
+        __atomic_store_n(&x->index[b], (uint8_t)s, __ATOMIC_RELEASE);
+        __atomic_store_n(&h->count, (uint16_t)(cnt + 1), __ATOMIC_RELEASE);
         return 0;
     }
     case ART_N256: {
         art_n256_t *x = n;
         if (x->children[b] >= 0)
             return -1;
-        x->children[b] = cid;
-        h->count++;
+        uint16_t cnt = 0;
+        for (int i = 0; i < 256; i++)
+            if (x->children[i] >= 0)
+                cnt++;
+        __atomic_store_n(&x->children[b], cid, __ATOMIC_RELEASE);
+        __atomic_store_n(&h->count, (uint16_t)(cnt + 1), __ATOMIC_RELEASE);
         return 0;
     }
     }
@@ -1900,22 +2238,27 @@ static void art_rm(kvspace_t *kv, void *n, uint8_t b) {
         if (idx == 255)
             return;
         x->index[b] = 255;
-        int last = (int)h->count - 1;
-        if (idx != last) {
-            x->children[idx] = x->children[last];
-            for (int j = 0; j < 256; j++)
-                if (x->index[j] == last) {
-                    x->index[j] = idx;
-                    break;
-                }
+        uint64_t used = art_n48_used_mask(x);
+        int cnt = __builtin_popcountll(used);
+        if (cnt > 0) {
+            int last = 63 - __builtin_clzll(used);
+            if (idx < last) {
+                x->children[idx] = x->children[last];
+                for (int j = 0; j < 256; j++)
+                    if (x->index[j] == last) {
+                        x->index[j] = idx;
+                        break;
+                    }
+            }
         }
-        h->count--;
+        h->count = (uint16_t)cnt;
         break;
     }
     case ART_N256: {
         art_n256_t *x = n;
         x->children[b] = -1;
-        h->count--;
+        if (h->count > 0)
+            h->count--;
         break;
     }
     }
@@ -1951,7 +2294,9 @@ static int32_t art_leaf_chain(kvspace_t *kv, const uint8_t *key, int klen,
 
 /* ---- insert ---- */
 static int32_t art_ins(kvspace_t *kv, int32_t nid, const uint8_t *key, int klen,
-                       int d, uint64_t off) {
+                       int d, uint64_t off, int32_t *moved_old, int32_t *moved_to) {
+    *moved_old = -1;
+    *moved_to = -1;
     if (nid < 0)
         return art_leaf_chain(kv, key, klen, d, off);
 
@@ -1962,8 +2307,11 @@ static int32_t art_ins(kvspace_t *kv, int32_t nid, const uint8_t *key, int klen,
     int mpl = h->prefix_len < (klen - d) ? h->prefix_len : (klen - d);
 
     if (shared == mpl && (klen - d) < h->prefix_len) {
-        /* key 在节点 prefix 内部耗尽（含 d==klen）：拆出 shared
-         * 字节作新值，旧节点作 child */
+        /* Prefix split where new key ends inside h->prefix: clone h untouched. */
+        uint8_t ob = h->prefix[shared];
+        int32_t copy_id = art_clone_node_shortened(kv, nid, shared + 1);
+        if (copy_id < 0)
+            return -1;
         int32_t nn = art_new_node(kv, ART_N4);
         if (nn < 0)
             return -1;
@@ -1971,30 +2319,31 @@ static int32_t art_ins(kvspace_t *kv, int32_t nid, const uint8_t *key, int klen,
         nh->prefix_len = (uint8_t)shared;
         if (shared > 0)
             memcpy(nh->prefix, key + d, (size_t)shared);
-        uint8_t ob = h->prefix[shared];
-        h->prefix_len -= (uint8_t)(shared + 1);
-        if (h->prefix_len > 0)
-            memmove(h->prefix, h->prefix + shared + 1, h->prefix_len);
-        art_add(kv, nh, ob, nid);
+        art_add(kv, nh, ob, copy_id);
         art_val_store(nh, AV_MAKE(1, off));
+        *moved_old = nid;
+        *moved_to = copy_id;
         return nn;
     }
     if (shared < mpl) { // prefix split
+        uint8_t ob = h->prefix[shared];
+        int32_t copy_id = art_clone_node_shortened(kv, nid, shared + 1);
+        if (copy_id < 0)
+            return -1;
         int32_t nn = art_new_node(kv, ART_N4);
         if (nn < 0)
             return -1;
-        art_hdr_t *nh = art_hdr(kv, nn);
-        nh->prefix_len = (uint8_t)shared;
-        memcpy(nh->prefix, key + d, shared);
-        uint8_t ob = h->prefix[shared];
-        h->prefix_len -= (uint8_t)(shared + 1);
-        if (h->prefix_len > 0)
-            memmove(h->prefix, h->prefix + shared + 1, h->prefix_len);
-        art_add(kv, nh, ob, nid);
         int32_t leaf = art_leaf_chain(kv, key, klen, d + shared + 1, off);
         if (leaf < 0)
             return -1;
+        art_hdr_t *nh = art_hdr(kv, nn);
+        nh->prefix_len = (uint8_t)shared;
+        if (shared > 0)
+            memcpy(nh->prefix, key + d, (size_t)shared);
+        art_add(kv, nh, ob, copy_id);
         art_add(kv, nh, key[d + shared], leaf);
+        *moved_old = nid;
+        *moved_to = copy_id;
         return nn;
     }
     d += h->prefix_len;
@@ -2004,26 +2353,51 @@ static int32_t art_ins(kvspace_t *kv, int32_t nid, const uint8_t *key, int klen,
     }
     int32_t cid = art_child(kv, h, key[d]);
     if (cid >= 0) {
-        int32_t nc = art_ins(kv, cid, key, klen, d + 1, off);
+        int32_t sub_old = -1, sub_to = -1;
+        int32_t nc = art_ins(kv, cid, key, klen, d + 1, off, &sub_old, &sub_to);
         if (nc < 0)
             return -1;
         if (nc != cid) {
-            art_rm(kv, h, key[d]);
-            art_add(kv, h, key[d], nc);
+            h = art_hdr(kv, nid);
+            kv_journal_move_begin(kv, sub_old, sub_to, nid, key[d]);
+            if (art_replace_child(kv, h, key[d], nc) != 0) {
+                kv_journal_move_end(kv);
+                return -1;
+            }
+            art_mark_moved(kv, sub_old, sub_to);
+            kv_journal_move_end(kv);
         }
         return nid;
     }
     int32_t leaf = art_leaf_chain(kv, key, klen, d + 1, off);
     if (leaf < 0)
         return -1;
+    h = art_hdr(kv, nid);
+    bool n48_full = h->type == ART_N48 &&
+                    __builtin_popcountll(art_n48_used_mask((const art_n48_t *)h)) >= 48;
     if ((h->type == ART_N4 && h->count >= 4) ||
         (h->type == ART_N16 && h->count >= 16) ||
-        (h->type == ART_N48 && h->count >= 48)) {
-        int32_t g = art_grow(kv, h);
+        n48_full) {
+        int32_t g = art_grow(kv, nid);
         if (g < 0)
             return -1;
         art_add(kv, art_hdr(kv, g), key[d], leaf);
+        *moved_old = nid;
+        *moved_to = g;
         return g;
+    }
+    if (h->type == ART_N16 && h->count > 0) {
+        art_n16_t *x = (art_n16_t *)h;
+        if (key[d] < x->keys[h->count - 1]) {
+            /* CoW N16 mid-array insert so live sorted keys[] never shifts in place. */
+            int32_t copy_id = art_clone_node_shortened(kv, nid, 0);
+            if (copy_id < 0)
+                return -1;
+            art_add(kv, art_hdr(kv, copy_id), key[d], leaf);
+            *moved_old = nid;
+            *moved_to = copy_id;
+            return copy_id;
+        }
     }
     art_add(kv, h, key[d], leaf);
     return nid;
@@ -2219,9 +2593,18 @@ static int art_has_live_value(kvspace_t *kv, int32_t nid) {
     case ART_N16:
         children = ((art_n16_t *)h)->children;
         break;
-    case ART_N48:
-        children = ((art_n48_t *)h)->children;
-        break;
+    case ART_N48: {
+        art_n48_t *x = (art_n48_t *)h;
+        for (int i = 0; i < 256; i++) {
+            uint8_t idx = x->index[i];
+            if (idx >= 48)
+                continue;
+            int live = art_has_live_value(kv, x->children[idx]);
+            if (live != 0)
+                return live;
+        }
+        return 0;
+    }
     case ART_N256:
         children = ((art_n256_t *)h)->children;
         count = 256;
@@ -2525,6 +2908,9 @@ kvspace_t *kvspaceShmOpen(const char *path, size_t data_size) {
         kv->hdr->sbo_head_size = sbo_head;
         kv->hdr->sbo_data_size = data_size;
         kv->hdr->art_root = -1;
+        kv->hdr->pending_moved_old = -1;
+        kv->hdr->pending_moved_to = -1;
+        kv->hdr->pending_moved_par = UINT64_MAX;
         if (blocks_init(kv->art_meta, art_slab, ART_BLOCK_SZ) != 0 ||
             sbo_init(kv->sbo_meta, sbo_head, data_size) != 0)
             goto fail;
@@ -2554,6 +2940,13 @@ kvspace_t *kvspaceShmOpen(const char *path, size_t data_size) {
     /* growth code assumes the single-root pool layout (SBO_HEAD_FIXED) */
     if (kv->sbo_meta->root_slots != 1)
         goto fail;
+    if (!created && kv_sync(kv) != 0)
+        goto fail;
+    if (!created && __atomic_load_n(&kv->hdr->pending_moved_old, __ATOMIC_ACQUIRE) >= 0) {
+        kv_write_lock(kv);
+        kv_repair_pending_move(kv);
+        kv_write_unlock(kv);
+    }
 
     /* P2: 注册表认领。占满（N=64）拒绝 open，错误明确，不静默扩容。 */
     kv->p2_slot = p2_reg_claim(kv);
@@ -2916,105 +3309,209 @@ uint8_t *kvspaceShmGetByRef(kvspace_t *kv, kvspaceRef_t *ref,
     return raw;
 }
 
+/* Tear-free partial overwrite on leaf node id (caller holds kv_write_lock).
+ * Aligned 1/2/4/8-byte writes use a single store; wider writes allocate a new
+ * SBO box, copy-and-patch raw[0..rl), atomically swap h->val, and retire the old box. */
+static int shm_patch_leaf_locked(kvspace_t *kv, int32_t id, art_hdr_t *h,
+                                 uint64_t old_off, uint64_t cap,
+                                 uint8_t *raw, int32_t rl,
+                                 uint32_t offset, const uint8_t *buf,
+                                 uint32_t buf_len) {
+    if ((uint64_t)offset + buf_len > (uint64_t)rl || (uint64_t)rl > cap)
+        return -1;
+    if (buf_len == 0)
+        return 0;
+    if (shm_write_body_atomic(raw + offset, buf, buf_len)) {
+        gen_bump_value(kv, id);
+        return 0;
+    }
+    uint64_t gidx = 0;
+    if (garb_reserve(kv, &gidx) != 0)
+        return -1;
+    size_t alloc_len = (size_t)cap > (size_t)rl ? (size_t)cap : (size_t)rl;
+    uint64_t new_off = kv_sbo_alloc(kv, alloc_len);
+    if (new_off == (uint64_t)-1) {
+        garb_cancel(kv, gidx);
+        return -1;
+    }
+    /* Recompute pointers in case kv_sbo_alloc grew .sbo.data / ART mappings. */
+    h = art_hdr(kv, id);
+    if (!h) {
+        garb_cancel(kv, gidx);
+        kv_sbo_free(kv, new_off);
+        return -1;
+    }
+    const uint8_t *src = kv->sbo_data + old_off;
+    uint8_t *dst = kv->sbo_data + new_off;
+    memcpy(dst, src, (size_t)rl);
+    memcpy(dst + offset, buf, buf_len);
+    art_val_store(h, AV_MAKE(1, new_off));
+    gen_bump_struct(kv, id);
+    gen_bump_value(kv, id);
+    garb_commit(kv, gidx, old_off, cap);
+    return 0;
+}
+
 int kvspaceShmSetPartByRef(kvspace_t *kv, kvspaceRef_t *ref,
                            const char *key_fallback, uint32_t offset,
                            const uint8_t *buf, uint32_t buf_len) {
     if (!kv || !ref || !buf)
         return -1;
-    if (kv_sync(kv) != 0)
+    kv_write_lock(kv);
+    if (kv_sync(kv) != 0) {
+        kv_write_unlock(kv);
         return -1;
+    }
     int32_t id = ref_leaf(kv, ref, key_fallback);
     art_hdr_t *h = id >= 0 ? art_hdr(kv, id) : NULL;
-    /* SLACK 的 part-write 快路径：固定 8 字节 head 直读 + per-box 物理容量校验后
-     * 写正文。任何不自洽（gen>0、无值、storetype/ptr 不符、offset/buf_len 越界、
-     * 超出 box 物理容量）一律回退现有路径，行为不变。不修改 head。 */
     uint64_t hv = h ? art_val_load(h) : 0;
     if (h && AV_HAS(hv) && ref->gen == 0) {
         uint64_t data_size = kv->hdr->sbo_data_size;
         uint64_t off = AV_OFF(hv);
         if (off <= data_size && data_size - off >= KVSPACE_XVALUE_HEAD_LEN) {
-            const uint8_t *hs = kv->sbo_data + off;
+            uint8_t *hs = kv->sbo_data + off;
             kvspaceXvalueHead w;
             memcpy(&w, hs, sizeof w);
             if (w.storetype == KVSPACE_XVALUE_ST_SLACK &&
                 w.ptr == KVSPACE_XVALUE_PTR_INLINE) {
                 uint64_t len = kvspaceXvalueHeadLen(&w);
-                /* per-box 物理容量：损坏 head 的 len 可能大于 box 但仍在全局内，
-                 * 不做这一步会跨 box 写坏相邻值。 */
                 uint64_t cap = sbo_allocated_size(kv->sbo_meta, off);
                 if (cap <= data_size - off && len <= cap - KVSPACE_XVALUE_HEAD_LEN &&
                     (uint64_t)offset <= KVSPACE_XVALUE_HEAD_LEN + len &&
                     (uint64_t)buf_len <=
                         KVSPACE_XVALUE_HEAD_LEN + len - (uint64_t)offset) {
-                    kv_gens_t *g = gens_at(kv, id);
-                    if (g)
-                        __atomic_add_fetch(&g->value_gen, 1u,
-                                           __ATOMIC_ACQ_REL);
-                    memcpy(kv->sbo_data + off + offset, buf, buf_len);
-                    if (g)
-                        __atomic_add_fetch(&g->value_gen, 1u,
-                                           __ATOMIC_ACQ_REL);
-                    return 0;
+                    if (shm_write_body_atomic(hs + offset, buf, buf_len)) {
+                        gen_bump_value(kv, id);
+                        kv_write_unlock(kv);
+                        return 0;
+                    }
+                    int32_t rl = 0;
+                    if (parse_value(hs, cap, &rl) == 0) {
+                        int rc = shm_patch_leaf_locked(kv, id, h, off, cap, hs,
+                                                       rl, offset, buf, buf_len);
+                        kv_write_unlock(kv);
+                        return rc;
+                    }
                 }
             }
         }
     }
     if (!h || !AV_HAS(hv)) {
-        if (ref->gen != 0)
+        if (ref->gen != 0 || !key_fallback) {
+            kv_write_unlock(kv);
             return -1;
-        if (!key_fallback)
-            return -1;
+        }
         int32_t rl = 0;
         uint8_t *d = kvspaceShmGet(kv, key_fallback, 0, &rl);
-        /* Re-bound by physical box capacity before writing; use u64 to prevent u32 wraparound. */
-        if (!d || read_value(kv, (uint64_t)(d - kv->sbo_data), &d, &rl) != 0 ||
-            (uint64_t)offset + buf_len > (uint64_t)rl)
+        if (!d) {
+            kv_write_unlock(kv);
             return -1;
-        kvspaceShmResolveRef(kv, key_fallback, ref);
-        kv_gens_t *g = gens_at(kv, (int32_t)ref->block_id);
-        if (g)
-            __atomic_add_fetch(&g->value_gen, 1u, __ATOMIC_ACQ_REL);
-        memcpy(d + offset, buf, buf_len);
-        if (g)
-            __atomic_add_fetch(&g->value_gen, 1u, __ATOMIC_ACQ_REL);
-        return 0;
+        }
+        uint64_t off = (uint64_t)(d - kv->sbo_data);
+        uint64_t cap = sbo_allocated_size(kv->sbo_meta, off);
+        if (parse_value(d, cap, &rl) != 0 ||
+            (uint64_t)offset + buf_len > (uint64_t)rl ||
+            kvspaceShmResolveRef(kv, key_fallback, ref) != 0) {
+            kv_write_unlock(kv);
+            return -1;
+        }
+        int32_t lid = (int32_t)ref->block_id;
+        art_hdr_t *lh = art_hdr(kv, lid);
+        if (!lh || !AV_HAS(art_val_load(lh))) {
+            kv_write_unlock(kv);
+            return -1;
+        }
+        int rc = shm_patch_leaf_locked(kv, lid, lh, off, cap, d, rl, offset,
+                                       buf, buf_len);
+        kv_write_unlock(kv);
+        return rc;
     }
-    uint8_t *raw;
-    int32_t rl;
-    if (read_value(kv, AV_OFF(hv), &raw, &rl) < 0 ||
-        (uint64_t)offset + buf_len > (uint64_t)rl)
+    uint64_t off = AV_OFF(hv);
+    uint64_t cap = sbo_allocated_size(kv->sbo_meta, off);
+    uint8_t *raw = kv->sbo_data + off;
+    int32_t rl = 0;
+    if (parse_value(raw, cap, &rl) < 0 ||
+        (uint64_t)offset + buf_len > (uint64_t)rl) {
+        kv_write_unlock(kv);
         return -1;
-    kv_gens_t *g2 = gens_at(kv, id);
-    if (g2)
-        __atomic_add_fetch(&g2->value_gen, 1u, __ATOMIC_ACQ_REL);
-    memcpy(raw + offset, buf, buf_len);
-    if (g2)
-        __atomic_add_fetch(&g2->value_gen, 1u, __ATOMIC_ACQ_REL);
-    return 0;
+    }
+    int rc = shm_patch_leaf_locked(kv, id, h, off, cap, raw, rl, offset, buf,
+                                   buf_len);
+    kv_write_unlock(kv);
+    return rc;
 }
 
 /* Partial write by key (follows links and extindex fallback like Get with resolve=1).
- * Locates via lock-free read, then re-bounds by physical box capacity before writing. */
+ * Re-bounds by physical box capacity under write_lock before writing. */
 int kvspaceShmSetPart(kvspace_t *kv, const char *key, uint32_t offset,
                       const uint8_t *buf, uint32_t buf_len) {
     if (!kv || !key || (buf_len && !buf))
         return -1;
+    kv_write_lock(kv);
     int32_t rl = 0;
     uint8_t *d = kvspaceShmGet(kv, key, 1, &rl);
-    if (!d || read_value(kv, (uint64_t)(d - kv->sbo_data), &d, &rl) != 0 ||
-        (uint64_t)offset + buf_len > (uint64_t)rl)
+    if (!d) {
+        kv_write_unlock(kv);
         return -1;
-    memcpy(d + offset, buf, buf_len);
-    return 0;
+    }
+    uint64_t off = (uint64_t)(d - kv->sbo_data);
+    uint64_t cap = sbo_allocated_size(kv->sbo_meta, off);
+    if (parse_value(d, cap, &rl) != 0 ||
+        (uint64_t)offset + buf_len > (uint64_t)rl) {
+        kv_write_unlock(kv);
+        return -1;
+    }
+    art_hdr_t *th = NULL;
+    char kbuf[1024];
+    uint8_t *rraw;
+    int32_t rrl;
+    int rfetched = 0;
+    th = resolve_fetch(kv, key, kbuf, sizeof kbuf, &rraw, &rrl, &rfetched);
+    if (!th || !AV_HAS(art_val_load(th)) || AV_OFF(art_val_load(th)) != off) {
+        /* Target lives under extindex mount; resolve its backing leaf. */
+        char *parent = NULL, *name = NULL;
+        psplit(kbuf, &parent, &name);
+        char extpath[1024];
+        th = NULL;
+        if (parent && name && dir_ext_path(kv, parent, extpath, sizeof extpath)) {
+            char *target = pjoin(extpath, name);
+            th = art_search(kv, kv->hdr->art_root, (const uint8_t *)target,
+                            (int)strlen(target));
+            free(target);
+        }
+        free(parent);
+        free(name);
+    }
+    if (!th || !AV_HAS(art_val_load(th))) {
+        kv_write_unlock(kv);
+        return -1;
+    }
+    int32_t tid = art_id_of(kv, th);
+    int rc = shm_patch_leaf_locked(kv, tid, th, off, cap, d, rl, offset, buf,
+                                   buf_len);
+    kv_write_unlock(kv);
+    return rc;
 }
 
-/* /vthread/<vid>/‥status：合法内容长度上限与创建时物理容量下限。 */
+/* /vthread/<vid>/..status: maximum content length and minimum physical box capacity. */
 #define KVSPACE_STATUS_MAX_LEN 16u
 #define KVSPACE_STATUS_MIN_CAP 80u
+/* /vthread/<vid>/..pc: minimum physical box capacity (8B head + 1024B body + 2B attr). */
+#define KVSPACE_PC_MIN_CAP 1034u
 
 static int is_vthread_status_key(const char *key) {
     static const char pfx[] = "/vthread/";
     static const char suf[] = "/\xE2\x80\xA5status";
+    if (!key)
+        return 0;
+    size_t n = strlen(key), sl = sizeof suf - 1;
+    return n > sl && strncmp(key, pfx, sizeof pfx - 1) == 0 &&
+           memcmp(key + n - sl, suf, sl) == 0;
+}
+
+static int is_vthread_pc_key(const char *key) {
+    static const char pfx[] = "/vthread/";
+    static const char suf[] = "/\xE2\x80\xA5pc";
     if (!key)
         return 0;
     size_t n = strlen(key), sl = sizeof suf - 1;
@@ -3070,23 +3567,55 @@ int kvspaceShmXvalueBodyView(kvspace_t *kv, const kvspaceRef_t *ref,
     return 0;
 }
 
+/* Check if an overwrite can safely update ONLY an aligned 1/2/4/8-byte scalar
+ * body in place (with identical 8-byte head and identical trailing attr). */
+static bool can_atomic_scalar_overwrite(const uint8_t *old_raw, uint64_t cap,
+                                        const uint8_t *val, int32_t val_len,
+                                        uint32_t *out_blen) {
+    if (val_len < (int32_t)KVSPACE_XVALUE_HEAD_LEN + 2 || (uint64_t)val_len > cap)
+        return false;
+    if (memcmp(old_raw, val, KVSPACE_XVALUE_HEAD_LEN) != 0)
+        return false;
+    kvspaceXvalueHead hd;
+    memcpy(&hd, val, sizeof hd);
+    if (hd.ptr != KVSPACE_XVALUE_PTR_INLINE)
+        return false;
+    uint64_t blen = kvspaceXvalueHeadLen(&hd);
+    if (!(blen == 1 || blen == 2 || blen == 4 || blen == 8))
+        return false;
+    const uint8_t *dst = old_raw + KVSPACE_XVALUE_HEAD_LEN;
+    if (((uintptr_t)dst & (uintptr_t)(blen - 1)) != 0)
+        return false;
+    uint64_t env_off = KVSPACE_XVALUE_HEAD_LEN + blen;
+    if ((uint64_t)val_len < env_off + 2)
+        return false;
+    size_t attr_len = (size_t)((uint64_t)val_len - env_off);
+    if (memcmp(old_raw + env_off, val + env_off, attr_len) != 0)
+        return false;
+    *out_blen = (uint32_t)blen;
+    return true;
+}
+
 /* Raw local write (internal helper without container/member semantics).
- * reserve: minimum physical box capacity (for WriteNewPlace body_cap); 0 uses val_len. */
-static int shm_set_local(kvspace_t *kv, const char *key, const uint8_t *val,
-                         int32_t val_len, art_hdr_t *old, size_t reserve) {
+ * reserve: minimum physical box capacity (for WriteNewPlace body_cap); 0 uses val_len.
+ * Caller holds kv_write_lock(kv). */
+static int shm_set_local_locked(kvspace_t *kv, const char *key, const uint8_t *val,
+                                int32_t val_len, art_hdr_t *old, size_t reserve) {
     size_t alloc_len = (size_t)val_len;
     if (reserve > alloc_len)
         alloc_len = reserve;
     if (is_vthread_status_key(key) && alloc_len < KVSPACE_STATUS_MIN_CAP)
         alloc_len = KVSPACE_STATUS_MIN_CAP;
+    if (is_vthread_pc_key(key) && alloc_len < KVSPACE_PC_MIN_CAP)
+        alloc_len = KVSPACE_PC_MIN_CAP;
     uint64_t ohv = old ? art_val_load(old) : 0;
     bool retiring = old && AV_HAS(ohv);
     uint64_t gidx = 0;
     uint64_t cap = 0;
     if (retiring) {
         cap = sbo_allocated_size(kv->sbo_meta, AV_OFF(ohv));
-        if ((uint64_t)alloc_len <= cap) {
-            /* Existing box fits (including reserve): write in place under value_gen seqlock */
+        if (reserve > 0 && (uint64_t)alloc_len <= cap) {
+            /* Reserved-capacity WriteNewPlace: caller fills body after return. */
             kv_gens_t *g = gens_at(kv, art_id_of(kv, old));
             if (g)
                 __atomic_add_fetch(&g->value_gen, 1u, __ATOMIC_ACQ_REL);
@@ -3095,7 +3624,24 @@ static int shm_set_local(kvspace_t *kv, const char *key, const uint8_t *val,
                 __atomic_add_fetch(&g->value_gen, 1u, __ATOMIC_ACQ_REL);
             return 0;
         }
-        /* 换 box：reserve 在任何变更之前；失败 = 硬错误、旧值原样 */
+        const uint8_t *old_raw = kv->sbo_data + AV_OFF(ohv);
+        int32_t old_rl = 0;
+        if (reserve == 0 && (uint64_t)alloc_len <= cap &&
+            parse_value(old_raw, cap, &old_rl) == 0 && old_rl == val_len &&
+            memcmp(old_raw, val, (size_t)val_len) == 0) {
+            return 0;
+        }
+        uint32_t sblen = 0;
+        if (reserve == 0 && (uint64_t)alloc_len <= cap &&
+            can_atomic_scalar_overwrite(old_raw, cap, val, val_len, &sblen)) {
+            /* Tear-free single-instruction scalar overwrite with unchanged head+attr. */
+            (void)shm_write_body_atomic(
+                kv->sbo_data + AV_OFF(ohv) + KVSPACE_XVALUE_HEAD_LEN,
+                val + KVSPACE_XVALUE_HEAD_LEN, sblen);
+            gen_bump_value(kv, art_id_of(kv, old));
+            return 0;
+        }
+        /* CoW box replacement: reserve garbage slot before mutating state. */
         if (garb_reserve(kv, &gidx) != 0)
             return -1;
 #ifdef P2_TEST_HOOKS
@@ -3124,15 +3670,22 @@ static int shm_set_local(kvspace_t *kv, const char *key, const uint8_t *val,
         return -1;
     }
 #endif
-    int32_t root = art_ins(kv, kv->hdr->art_root, (const uint8_t *)key,
-                           (int)strlen(key), 0, off);
+    int32_t moved_old = -1, moved_to = -1;
+    int32_t old_root = kv->hdr->art_root;
+    int32_t root = art_ins(kv, old_root, (const uint8_t *)key,
+                           (int)strlen(key), 0, off, &moved_old, &moved_to);
     if (root < 0) {
         if (retiring)
             garb_cancel(kv, gidx);
         kv_sbo_free(kv, off);          /* 新 box 从未被引用 */
         return -1;
     }
-    kv->hdr->art_root = root;
+    if (root != old_root) {
+        kv_journal_move_begin(kv, moved_old, moved_to, -1, 0);
+        __atomic_store_n(&kv->hdr->art_root, root, __ATOMIC_RELEASE);
+        art_mark_moved(kv, moved_old, moved_to);
+        kv_journal_move_end(kv);
+    }
     {   /* 换 box / 墓碑复活：旧 token 全部 STALE */
         int32_t nid = p2_node_at(kv, key);
         kv_gens_t *g = gens_at(kv, nid);
@@ -3150,9 +3703,16 @@ static int shm_set_local(kvspace_t *kv, const char *key, const uint8_t *val,
 
 static int shm_set_raw(kvspace_t *kv, const char *key, const uint8_t *val,
                        int32_t val_len, size_t reserve) {
+    kv_write_lock(kv);
+    if (kv_sync(kv) != 0) {
+        kv_write_unlock(kv);
+        return -1;
+    }
     art_hdr_t *old = art_search(kv, kv->hdr->art_root, (const uint8_t *)key,
                                 (int)strlen(key));
-    return shm_set_local(kv, key, val, val_len, old, reserve);
+    int rc = shm_set_local_locked(kv, key, val, val_len, old, reserve);
+    kv_write_unlock(kv);
+    return rc;
 }
 
 static int frame_operand_ptr(const char *key, const kvspaceXvalueHead *wire) {
@@ -3170,11 +3730,9 @@ static int frame_operand_ptr(const char *key, const kvspaceXvalueHead *wire) {
     return col != 0 && *end++ == ']' && *end == '\0';
 }
 
-static int shm_set_validated(kvspace_t *kv, const char *key,
-                            const uint8_t *val, int32_t val_len,
-                            const kvspaceXvalueHead *wire) {
-    if (kv_sync(kv) != 0)
-        return -1;
+static int shm_set_validated_locked(kvspace_t *kv, const char *key,
+                                    const uint8_t *val, int32_t val_len,
+                                    const kvspaceXvalueHead *wire) {
     char kbuf[1024];
     if (strlen(key) >= sizeof kbuf || strstr(key, "//") ||
         reserved_meta_path(key))
@@ -3224,7 +3782,20 @@ static int shm_set_validated(kvspace_t *kv, const char *key,
                 return -1;
         }
     }
-    return shm_set_local(kv, kbuf, val, val_len, local, 0);
+    return shm_set_local_locked(kv, kbuf, val, val_len, local, 0);
+}
+
+static int shm_set_validated(kvspace_t *kv, const char *key,
+                            const uint8_t *val, int32_t val_len,
+                            const kvspaceXvalueHead *wire) {
+    kv_write_lock(kv);
+    if (kv_sync(kv) != 0) {
+        kv_write_unlock(kv);
+        return -1;
+    }
+    int rc = shm_set_validated_locked(kv, key, val, val_len, wire);
+    kv_write_unlock(kv);
+    return rc;
 }
 
 int kvspaceShmSet(kvspace_t *kv, const char *key, const uint8_t *val,
@@ -3253,17 +3824,24 @@ int kvspaceShmSetValueByRef(kvspace_t *kv, kvspaceRef_t *ref,
     if (!kv || !ref || !key_fallback || !val || val_len <= 0 ||
         value_ok(val, val_len, &head) != 0)
         return -2;
-    if (kv_sync(kv) != 0)
-        return -1;
     if (strlen(key_fallback) >= 1024 || strstr(key_fallback, "//") ||
         reserved_meta_path(key_fallback))
         return -1;
+    kv_write_lock(kv);
+    if (kv_sync(kv) != 0) {
+        kv_write_unlock(kv);
+        return -1;
+    }
     int32_t id = ref_leaf(kv, ref, key_fallback);
     art_hdr_t *h = id >= 0 ? art_hdr(kv, id) : NULL;
-    if (h && AV_HAS(art_val_load(h)))
-        return shm_set_local(kv, key_fallback, val, val_len, h, 0);
+    if (h && AV_HAS(art_val_load(h))) {
+        int rc = shm_set_local_locked(kv, key_fallback, val, val_len, h, 0);
+        kv_write_unlock(kv);
+        return rc;
+    }
     /* ref 过期或尚无值：退回完整按 key 写（含 extindex 检查），成功后重解析。 */
-    int rc = shm_set_validated(kv, key_fallback, val, val_len, &head);
+    int rc = shm_set_validated_locked(kv, key_fallback, val, val_len, &head);
+    kv_write_unlock(kv);
     if (rc == 0)
         kvspaceShmResolveRef(kv, key_fallback, ref);
     return rc;
@@ -3366,26 +3944,31 @@ int kvspaceShmWriteNewPlace(kvspace_t *kv, const char *key, uint8_t ref,
 
 /* Delete a single key directly (without following links) and without bumping
  * list_gen. Returns 1 = deleted, 0 = missing, -1 = hard error (tree unchanged).
- * Caller has called kv_sync and verified strlen(key) < 1024. */
-static int shm_del_key(kvspace_t *kv, const char *key) {
+ * Caller has called kv_sync, verified strlen(key) < 1024, and holds kv_write_lock(kv). */
+static int shm_del_key_locked(kvspace_t *kv, const char *key) {
     bool d = false;
     int32_t root = art_del(kv, kv->hdr->art_root, (const uint8_t *)key,
                            (int)strlen(key), 0, &d);
     if (root < 0)
         return -1;
-    kv->hdr->art_root = root;
+    __atomic_store_n(&kv->hdr->art_root, root, __ATOMIC_RELEASE);
     return d ? 1 : 0;
 }
 
 int kvspaceShmDel(kvspace_t *kv, const char *key) {
     if (!kv || !key)
         return -1;
-    if (kv_sync(kv) != 0)
-        return -1;
     if (strlen(key) >= 1024)
         return -1;                  /* Reject instead of truncating into another key */
+    kv_write_lock(kv);
+    if (kv_sync(kv) != 0) {
+        kv_write_unlock(kv);
+        return -1;
+    }
     /* Delete the key itself without following links; explicit deref belongs to runtime */
-    if (shm_del_key(kv, key) != 1)
+    int rc = shm_del_key_locked(kv, key);
+    kv_write_unlock(kv);
+    if (rc != 1)
         return -1;
     list_gen_bump(kv);              /* Key disappeared: bump after CAS */
     return 0;
@@ -3468,17 +4051,24 @@ int kvspaceShmDeltree(kvspace_t *kv, const char *prefix) {
         return -1;
     }
     int rc = 0, any = 0;
+    kv_write_lock(kv);
+    if (kv_sync(kv) != 0) {
+        kv_write_unlock(kv);
+        keyscan_free(&keys);
+        return -1;
+    }
     for (int32_t i = 0; i < keys.count; i++) {
         const char *k = keys.keys[i];
         if (!subtree_key(base, bl, k) || reserved_meta_path(k) ||
             strlen(k) >= 1024)
             continue;
-        int d = shm_del_key(kv, k);
+        int d = shm_del_key_locked(kv, k);
         if (d < 0)
             rc = -1;
         else if (d)
             any = 1;
     }
+    kv_write_unlock(kv);
     keyscan_free(&keys);
     if (any)
         list_gen_bump(kv);          /* Keys disappeared: bump once after batch delete */
